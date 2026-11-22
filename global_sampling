@@ -1,0 +1,123 @@
+clear; clc;
+warning('off', 'MATLAB:ode15s:IntegrationTolNotMet');
+
+%% Settings
+file0   = 'global_sample_lowC0_result_heat0.mat';
+file1   = 'global_sample_lowC0_result_heat1.mat';
+show_C  = false;          % true: heating-constrained sample
+n_best  = 5;              % hits in panel B
+C_low   = 0.5;            
+min_depth = 0.02;  min_rebound = 0.02;   % same thresholds as the sampling
+out = 'fig_S4_shape';
+
+% match global_sample_lowC0.m
+N = 100;  M0 = 100;  T1 = 300;  T_end = 200;  t_skip = 2;
+plateau_win = [150 200];  smooth_win = 3;  dt = 0.05;
+odeopts = odeset('RelTol', 1e-6, 'AbsTol', 1e-9);
+fs = 10;
+
+%% Load
+R0 = load(file0);
+nP = 1 + show_C;  nPan = 2 + show_C;
+
+fig = figure('Color', 'w', 'Position', [60 60 470*nPan 420]);
+tl = tiledlayout(1, nPan, 'TileSpacing', 'compact', 'Padding', 'compact');
+
+%% Panel A: shape space
+shape_panel(nexttile(tl), R0, min_depth, min_rebound, fs, 'A');
+
+%% Panel B: closest hits
+axB = nexttile(tl); hold(axB, 'on');
+plot(axB, R0.tL.tb, R0.tL.yn, 'k.', 'MarkerSize', 7, 'DisplayName', ...
+     sprintf('data, %.2g \\muM', C_low));
+[~, order] = sort(R0.dist);
+hits = order(isfinite(R0.dist(order)));
+hits = hits(1:min(n_best, numel(hits)));
+cols = lines(numel(hits));
+ctx = struct('N', N, 'M0', M0, 'T1', T1, 'T_end', T_end, 'dt', dt, ...
+             'sizes', [2, 6, 12 + 2*(0:N-1)], 'odeopts', odeopts, ...
+             't_skip', t_skip, 'pw', plateau_win, 'sw', smooth_win);
+for r = 1:numel(hits)
+    n = hits(r);
+    [tf, yn] = simulate_normalized(R0.P(n,:), R0.s_all(n), C_low, ctx);
+    plot(axB, tf, yn, '-', 'Color', cols(r,:), 'LineWidth', 1.4, ...
+         'DisplayName', sprintf('set #%d', n));
+end
+yline(axB, 0, 'k:', 'HandleVisibility', 'off');
+xlim(axB, [0 T_end]);  grid(axB, 'on');  box(axB, 'on');
+xlabel(axB, 'time (min)');
+ylabel(axB, '(y - y_\infty) / (y_0 - y_\infty)');
+legend(axB, 'Location', 'northeast', 'FontSize', fs-1);
+set(axB, 'FontSize', fs);
+label(axB, 'B', fs);
+if isempty(hits), text(axB, 20, 0.5, 'no hits', 'FontSize', fs+2); end
+
+%% Panel C: Constrained sample
+if show_C
+    R1 = load(file1);
+    shape_panel(nexttile(tl), R1, min_depth, min_rebound, fs, 'C');
+end
+
+try
+    exportgraphics(fig, [out '.pdf'], 'ContentType', 'vector');
+    exportgraphics(fig, [out '.png'], 'Resolution', 300);
+catch
+    set(fig, 'PaperPositionMode', 'auto');
+    print(fig, out, '-dpdf', '-painters');  print(fig, out, '-dpng', '-r300');
+end
+fprintf('Saved %s.pdf and %s.png\n', out, out);
+
+%% Functions
+
+function shape_panel(ax, R, dmin, rmin, fs, L)
+    hold(ax, 'on');
+    F = R.F;  ok = R.st == 1;
+    osc = false(size(ok));  if isfield(R, 'osc'), osc = R.osc; end
+    v = ok & ~osc;
+    scatter(ax, F(v,1), F(v,3), 8, F(v,2), 'filled', 'MarkerFaceAlpha', 0.5);
+    colormap(ax, parula);  caxis(ax, [0 40]);
+    cb = colorbar(ax);  ylabel(cb, 'time of minimum (min)');
+    if any(osc)
+        plot(ax, F(osc,1), F(osc,3), 'x', 'Color', [0.6 0.6 0.6], 'MarkerSize', 3);
+    end
+    plot(ax, R.tL.rel_depth, R.tL.rel_rebound, 'p', 'MarkerSize', 15, ...
+         'MarkerFaceColor', 'y', 'MarkerEdgeColor', 'k');
+    xline(ax, dmin, 'k:');  yline(ax, rmin, 'k:');
+    xlim(ax, [-1 2]);
+    yl = prctile(F(ok,3), [1 99]);
+    ylim(ax, [min(yl(1), -0.05), max([yl(2), 1.5*R.tL.rel_rebound, 0.1])]);
+    nout = sum(ok & (F(:,1) < -1 | F(:,1) > 2));
+    fprintf('Panel %s: %d sets outside the plotted dip range [-1, 2]\n', L, nout);
+    xlabel(ax, 'relative dip below long-term level');
+    ylabel(ax, 'relative rise above long-term level');
+    grid(ax, 'on');  box(ax, 'on');  set(ax, 'FontSize', fs);
+    label(ax, L, fs);
+end
+
+function label(ax, L, fs)
+    title(ax, L, 'FontSize', fs+3, 'FontWeight', 'bold', 'Units', 'normalized', ...
+          'Position', [0.02 0.98], 'HorizontalAlignment', 'left', ...
+          'VerticalAlignment', 'top', 'BackgroundColor', 'w', 'Margin', 1);
+end
+
+% same simulation as global_sample_lowC0.m (run_one), normalized signal
+function [tf, yn] = simulate_normalized(p, s, C, ctx)
+    q = num2cell(p);
+    [alpha, rho, omega, sigma, beta, mu, lambda, ...
+     gamma1, tau1, delta1, k1, gamma2, tau2, delta2, k2] = q{:};
+    alpha = alpha*s;  lambda = lambda*s;  k1 = k1*s;  k2 = k2*s;
+    rho = rho*s^2;  sigma = sigma*s^2;  beta = beta*s^2;  tau1 = tau1*s^2;  tau2 = tau2*s^2;
+    N = ctx.N;  sizes = ctx.sizes;
+    F1 = @(t, Z) F_ode(Z, ctx.M0/s, 6, 12, N, alpha, sigma, rho, omega, beta, mu, ...
+                       lambda, gamma1, tau1, delta1, k1);
+    sol1 = ode15s(F1, [0 ctx.T1], zeros(N+2, 1), ctx.odeopts);
+    z = sol1.y(:, end);  z(1:2) = 0;  z = z / (sizes*z);
+    F2 = @(t, Z) F_ode(Z, C, 6, 12, N, alpha, sigma, rho, omega, beta, mu, ...
+                       lambda, gamma2, tau2, delta2, k2);
+    sol2 = ode15s(F2, [0 ctx.T_end], z*C, ctx.odeopts);
+    tf = (0:ctx.dt:ctx.T_end).';
+    Mw = ((C - sizes*deval(sol2, tf.') + (sizes.^2)*deval(sol2, tf.')) / C).';
+    Ms = movmean(Mw, round(ctx.sw/ctx.dt));
+    pl = mean(Ms(tf >= ctx.pw(1) & tf <= ctx.pw(2)));
+    yn = (Ms - pl) / (Mw(1) - pl);
+end
