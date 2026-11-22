@@ -1,0 +1,162 @@
+clear; clc;
+warning('off', 'MATLAB:ode15s:IntegrationTolNotMet');
+
+%% Settings
+resfile = 'basin_map_monomer_result.mat';
+M0 = 100;  T1 = 300;     % stage-1 for the basin map (50 and 90 if rerun)
+N  = 100;
+C0_c   = 0.5;            % Concentration for panel C
+T_c    = 2000;           % simulated duration for panel C
+T_show = 300;            % time range shown in panel C
+s_exp  = [];             % e.g. 2.22
+out    = 'fig16_bistability';
+
+col_P1 = [0.00 0.45 0.74];      % M(0) = 0
+col_M  = [0.85 0.33 0.10];      % M(0) = C0
+col_C  = [0.85 0.00 0.00];      % C0_c line
+fs = 11;
+dy_img = 0.0025;
+
+odeopts = odeset('RelTol', 1e-7, 'AbsTol', 1e-10);
+
+%% Load basin map
+S = load(resfile);
+C0_grid = S.C0_grid(:).';  fM_grid = S.fM_grid(:).';  MW = S.MW;  thr = S.thr;  q = S.q;
+if isfield(S, 'DR'), unconv = S.DR > 0.01; else, unconv = false(size(MW)); end
+
+iP1 = 1;  iMo = numel(fM_grid);       % M(0) = 0 and M(0) = C0
+mP1 = MW(iP1, :);  mMo = MW(iMo, :);
+diffC = C0_grid((mP1 > thr) ~= (mMo > thr));
+if isempty(diffC)
+    warning('No hysteresis window found on the grid.');
+    win = [NaN NaN];
+else
+    win = [min(diffC) max(diffC)];
+end
+
+winEdge = win;
+if all(isfinite(win))
+    i1 = find(C0_grid == win(1), 1);  i2 = find(C0_grid == win(2), 1);
+    if i1 > 1,               winEdge(1) = mean(C0_grid([i1-1 i1])); end
+    if i2 < numel(C0_grid),  winEdge(2) = mean(C0_grid([i2 i2+1])); end
+end
+dC = median(diff(C0_grid));
+fprintf('Hysteresis window (model units): %.3f to %.3f uM (grid points; resolution %.3f)\n', ...
+        win, dC);
+if ~isempty(s_exp)
+    fprintf('Experimental units (C0/s, s = %.2f): %.3f to %.3f uM\n', s_exp, win/s_exp);
+end
+if C0_c < win(1) || C0_c > win(2)
+    warning('C0_c = %.3g is outside the hysteresis window: panel C will show no difference.', C0_c);
+end
+
+%% Panel C
+sizes = [2, 6, 12 + 2*(0:N-1)];
+F1 = @(t, Z) F_ode(Z, M0, 6, 12, N, q.alpha, q.sigma, q.rho, q.omega, q.beta, ...
+                   q.mu, q.lambda, q.gamma1, q.tau1, q.delta1, q.k1);
+[~, Y1] = ode15s(F1, [0 T1], zeros(N+2, 1), odeopts);
+z = Y1(end, :).';  z(1:2) = 0;  z = z / (sizes*z);   % end of oligomerization
+
+F2 = @(t, Z) F_ode(Z, C0_c, 6, 12, N, q.alpha, q.sigma, q.rho, q.omega, q.beta, ...
+                   q.mu, q.lambda, q.gamma2, q.tau2, q.delta2, q.k2);
+tc = (0:0.5:T_c);
+Mw_of = @(Y) (C0_c - sizes*Y + (sizes.^2)*Y) / C0_c;
+
+solP = ode15s(F2, [0 T_c], C0_c*z, odeopts);          % M(0) = 0
+solM = ode15s(F2, [0 T_c], zeros(N+2, 1), odeopts);   % M(0) = C0
+MwP = Mw_of(deval(solP, tc));
+MwM = Mw_of(deval(solM, tc));
+fprintf('Panel C at C0 = %.2f: final Mw from M(0)=0: %.2f, from M(0)=C0: %.2f\n', ...
+        C0_c, MwP(end), MwM(end));
+
+fprintf('\n--- For the caption ---\n');
+fprintf('(B) ... In the shaded range (%.2f <= C0 <= %.2f uM), the two starting states relax to different branches.\n', win);
+fprintf('(C) ... M(0) = 0 relaxes to M_w ~ %.1f, whereas M(0) = C0 remains at M_w ~ %.1f.\n', ...
+        MwP(end), MwM(end));
+if ~isempty(s_exp)
+    fprintf('Experimental units (s = %.2f): %.2f to %.2f uM\n', s_exp, win/s_exp);
+end
+
+%% Figure
+xlab = 'C_0 (\muM)';
+fig = figure('Name', 'Fig. 16 - bistability', 'Color', 'w', 'Position', [60 60 1500 430]);
+tl = tiledlayout(fig, 1, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
+
+% Panel A: basins
+axA = nexttile(tl); hold(axA, 'on');
+yq = 0:dy_img:1;
+xq = linspace(min(C0_grid), max(C0_grid), max(numel(C0_grid), 400));
+MWq = interp1(fM_grid, MW, yq, 'nearest', 'extrap');
+MWq = interp1(C0_grid, MWq.', xq, 'nearest', 'extrap').';
+imagesc(axA, xq, yq, MWq);  set(axA, 'YDir', 'normal');  axis(axA, 'tight');
+colormap(axA, parula);
+cb = colorbar(axA);  ylabel(cb, 'M_{w}^{tr}', 'FontSize', fs);
+[cc, mm] = meshgrid(C0_grid, fM_grid);
+if any(unconv(:)), plot(axA, cc(unconv), mm(unconv), 'wx', 'MarkerSize', 5); end
+xline(axA, C0_c, '-', sprintf('C_0 = %.2g', C0_c), 'Color', col_C, 'LineWidth', 1.5, ...
+      'LabelVerticalAlignment', 'middle', 'FontSize', fs-1);
+x_low = win(1);  if ~isfinite(x_low), x_low = min(C0_grid) + 0.1*range(C0_grid); end
+text(axA, mean([min(C0_grid), x_low]), 0.45, 'low branch', ...
+     'Color', 'w', 'FontSize', fs, 'Rotation', 90, 'HorizontalAlignment', 'center');
+text(axA, min(C0_grid) + 0.65*range(C0_grid), 0.45, 'high branch', ...
+     'Color', 'k', 'FontSize', fs, 'HorizontalAlignment', 'center');
+xlabel(axA, xlab, 'FontSize', fs);  ylabel(axA, 'M(0)/C_0', 'FontSize', fs);
+set(axA, 'FontSize', fs, 'Layer', 'top');  box(axA, 'on');
+
+% Panel B: two starting states
+axB = nexttile(tl); hold(axB, 'on');
+yl = [0, 1.1*max([mP1 mMo])];
+if all(isfinite(win))
+    patch(axB, [winEdge fliplr(winEdge)], [yl(1) yl(1) yl(2) yl(2)], [0.85 0.85 0.85], ...
+          'EdgeColor', 'none', 'FaceAlpha', 0.5, 'DisplayName', 'hysteresis window');
+end
+[xb, yb] = break_at_jumps(C0_grid, mP1, thr);
+plot(axB, xb, yb, 'o-', 'Color', col_P1, 'MarkerFaceColor', col_P1, ...
+     'LineWidth', 1.5, 'MarkerSize', 4, 'DisplayName', 'M(0) = 0');
+[xb, yb] = break_at_jumps(C0_grid, mMo, thr);
+plot(axB, xb, yb, 's-', 'Color', col_M, 'MarkerFaceColor', col_M, ...
+     'LineWidth', 1.5, 'MarkerSize', 4, 'DisplayName', 'M(0) = C_0');
+xline(axB, C0_c, '-', 'Color', col_C, 'LineWidth', 1.5, 'HandleVisibility', 'off');
+xlim(axB, [min(C0_grid) max(C0_grid)]);  ylim(axB, yl);
+xlabel(axB, xlab, 'FontSize', fs);  ylabel(axB, 'M_{w}^{tr}', 'FontSize', fs);
+legend(axB, 'Location', 'southeast', 'FontSize', fs-1);
+set(axB, 'FontSize', fs, 'Layer', 'top');  grid(axB, 'on');  box(axB, 'on');
+
+% Panel C: time courses
+axC = nexttile(tl); hold(axC, 'on');
+show = tc <= T_show;
+plot(axC, tc(show), MwP(show), '-', 'Color', col_P1, 'LineWidth', 2, 'DisplayName', 'M(0) = 0');
+plot(axC, tc(show), MwM(show), '-', 'Color', col_M,  'LineWidth', 2, 'DisplayName', 'M(0) = C_0');
+xlim(axC, [0 T_show]);  ylim(axC, [0, 1.1*max([MwP(show) MwM(show)])]);
+xlabel(axC, 'time (min)', 'FontSize', fs);  ylabel(axC, 'M_w', 'FontSize', fs);
+title(axC, sprintf('C_0 = %.2g \\muM', C0_c), 'FontSize', fs, 'FontWeight', 'normal');
+legend(axC, 'Location', 'east', 'FontSize', fs-1);
+set(axC, 'FontSize', fs);  grid(axC, 'on');  box(axC, 'on');
+
+%% Export
+try
+    exportgraphics(fig, [out '.pdf'], 'ContentType', 'vector');
+    exportgraphics(fig, [out '.png'], 'Resolution', 300);
+catch
+    set(fig, 'PaperPositionMode', 'auto');
+    print(fig, out, '-dpdf', '-painters');
+    print(fig, out, '-dpng', '-r300');
+end
+fprintf('Saved %s.pdf and %s.png\n', out, out);
+
+%% Functions
+function panel_label(ax, L, fs)
+    text(ax, -0.13, 1.05, L, 'Units', 'normalized', 'FontSize', fs+3, ...
+         'FontWeight', 'bold', 'Clipping', 'off');
+end
+
+function [xo, yo] = break_at_jumps(x, y, thr)
+    x = x(:).';  y = y(:).';
+    jump = find((y(1:end-1) > thr) ~= (y(2:end) > thr));
+    xo = x;  yo = y;
+    for k = numel(jump):-1:1
+        i = jump(k);
+        xo = [xo(1:i), NaN, xo(i+1:end)];
+        yo = [yo(1:i), NaN, yo(i+1:end)];
+    end
+end
