@@ -1,0 +1,144 @@
+clear all;
+clc;
+
+alpha=1e-2;
+rho=0.7;
+omega=0.1;
+sigma=1e-4;
+beta=150;
+mu=0.01;
+lambda=230;
+gamma=8;
+tau=0.8;
+delta=0.8;
+k1=250;
+
+%% PARAMETERS
+
+nT=2;
+n1=6;
+n2=12;
+N=100;
+
+sizes=[1,nT,n1,n2+nT*(0:N-1)];
+sizes_red=[2,n1,n2+2*(0:N-1)];
+
+%% Phase 1
+
+M=100;
+
+Z0=zeros(N+2,1);
+
+F1=@(t,Z) F_ode(Z,M,n1,n2,N,...
+    alpha,sigma,rho,omega,beta,mu,lambda,...
+    5,0.1,0.1,10);
+
+[~,Y]=ode23s(F1,[0 300],Z0);
+
+Y=Y';
+
+z0=Y(:,end)/M;
+z0(1)=0;
+z0(2)=0;
+
+M_agreg=sizes(2:end)*z0;
+z0_adim=z0/M_agreg;
+
+%% C0 values
+
+C0_values=[0.1 0.15 0.2 0.25 0.3];
+colors=lines(length(C0_values));
+tspan=[0 500];
+
+%% Figure
+
+fig = figure('Position',[50 50 1600 850]);
+tl  = tiledlayout(fig,2,3,'TileSpacing','compact','Padding','compact');
+
+ax = gobjects(6,1);
+for p = 1:6
+    ax(p) = nexttile(tl);
+    hold(ax(p),'on');
+    grid(ax(p),'on');
+end
+
+addLetter = @(a,L) text(a,-0.12,1.08,L,'Units','normalized',...
+    'FontSize',16,'FontWeight','bold');
+
+% Mw(t)
+title(ax(1),'MOLECULAR WEIGHT M_w(t)');
+xlabel(ax(1),'Time'); ylabel(ax(1),'M_w');
+
+% M(t)
+title(ax(2),'MONOMERS M(t)');
+xlabel(ax(2),'Time'); ylabel(ax(2),'M');
+
+% W(t)
+title(ax(3),'6-MERS W(t)');
+xlabel(ax(3),'Time'); ylabel(ax(3),'W');
+
+% T(t)
+title(ax(4),'DIMERS T(t)');
+xlabel(ax(4),'Time'); ylabel(ax(4),'T');
+
+% S(t)
+title(ax(5),'BASES S(t)');
+xlabel(ax(5),'Time'); ylabel(ax(5),'S');
+
+% Ei 3D
+title(ax(6),'AGGREGATES OF SIZE i E_i, 1 \leq i \leq 10');
+xlabel(ax(6),'Time'); ylabel(ax(6),'Polymer index i'); zlabel(ax(6),'E_i');
+view(ax(6),45,30);
+
+% Loop over C0
+
+hLeg = gobjects(length(C0_values),1);
+
+for k = 1:length(C0_values)
+
+    C0 = C0_values(k);
+    Z0 = z0_adim*C0;
+
+    F2 = @(t,Z) F_ode(Z,C0,n1,n2,N,...
+        alpha,sigma,rho,omega,...
+        beta,mu,lambda,...
+        gamma,tau,delta,k1);
+
+    [t,Y_late] = ode15s(F2,tspan,Z0);
+    Y_late = Y_late';
+
+    T  = Y_late(1,:);
+    W  = Y_late(2,:);
+    S  = Y_late(3,:);
+    Ei = Y_late(4:end,:);
+
+    V  = C0 - sizes_red*Y_late;
+    M2 = 1 - sizes_red*Y_late/C0 + sizes_red.^2*Y_late/C0;
+
+    c = colors(k,:);
+
+    % Species
+    hLeg(k) = plot(ax(1),t,M2,'LineWidth',2,'Color',c);
+    plot(ax(2),t,V,  'LineWidth',2,'Color',c);
+    plot(ax(3),t,W,  'LineWidth',2,'Color',c);
+    plot(ax(4),t,T,  'LineWidth',2,'Color',c);
+    plot(ax(5),t,S,  'LineWidth',2,'Color',c);
+
+    % Ei (i = 1,...,10)
+    for i = 1:10
+        plot3(ax(6),t,i*ones(size(t)),Ei(i,:),'Color',c,'LineWidth',2);
+    end
+end
+
+for p = 1:6
+    xlim(ax(p),tspan);
+end
+
+letters = 'ABCDEF';
+for p = 1:6
+    addLetter(ax(p),letters(p));
+end
+
+legendLabels = compose("C_{0} = %g", C0_values);
+lgd = legend(hLeg,legendLabels,'Interpreter','tex');
+lgd.Layout.Tile = 'east';
