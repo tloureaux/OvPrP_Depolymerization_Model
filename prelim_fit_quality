@@ -1,0 +1,227 @@
+clear; clc;
+
+%% Settings
+dataFile = 'SLS Data O1.xlsx';
+C0_list  = [8 6 4 2 1 0.5 0.41];
+
+s_list   = [1:0.25:5, 6, 8, 10, 12, 15];   % concentration scales to try
+scale_M0 = true;    % stage 1 runs at M0/s, so the P1 composition is identical
+                    % for every s
+
+t_skip   = 2;       % drop the temperature-jump transient
+bin_w    = 2;       % > limit-cycle period (~1.1 min at s = 1)
+t_end    = 200;     % optional cap on the fitted window
+late_frac = 0.2;    % last 20% of each curve, "long-term level"
+equal_curve_weight = true;
+
+N   = 100;  M0 = 100;  T1 = 300;  dt_fine = 0.05;
+
+p.alpha = 1e-2; p.rho = 0.7;  p.omega  = 0.1; p.sigma = 1e-4;
+p.beta  = 150;  p.mu  = 0.01; p.lambda = 230;
+s1 = struct('gamma', 5, 'tau', 0.1, 'delta', 0.1, 'k', 10);
+s2 = struct('gamma', 8, 'tau', 0.8, 'delta', 0.8, 'k', 250);
+
+odeopts = odeset('RelTol', 1e-8, 'AbsTol', 1e-11);
+
+%% Data
+raw = readmatrix(dataFile);
+nC  = numel(C0_list);
+data = struct('C0', {}, 't', {}, 'y', {});
+for j = 1:nC
+    t = raw(:, 2*j-1);  y = raw(:, 2*j);
+    ok = ~isnan(t) & ~isnan(y);
+    data(j).C0 = C0_list(j);  data(j).t = t(ok);  data(j).y = y(ok);
+end
+
+opt = struct('N', N, 'M0', M0, 'T1', T1, 't_skip', t_skip, 'bin_w', bin_w, ...
+             't_end', t_end, 'dt_fine', dt_fine, 'odeopts', odeopts, ...
+             'scale_M0', scale_M0, 'late_frac', late_frac, ...
+             'equal_w', equal_curve_weight);
+
+ Scan over s
+nS = numel(s_list);
+R  = cell(nS, 1);
+rms_s = zeros(nS, 1);
+for k = 1:nS
+    fprintf('s = .2g ... ', s_list(k)); tic;
+    D = simulate_all(s_list(k), data, p, s1, s2, opt);
+    [c, rms_tot, per] = global_fit(D, opt.equal_w);
+    R{k} = struct('s', s_list(k), 'D', D, 'c', c, 'per', per);
+    rms_s(k) = rms_tot;
+    fprintf('RMS = .4g, c1 = .4g, c2 = .4g  (.0f s)\n', rms_tot, c(1), c(2), toc);
+end
+[~, kb] = min(rms_s);
+best = R{kb};
+base = R{find(s_list == 1, 1)};
+
+fprintf('\n=== Best scale s = .2g  (C0_cr ~ .3g uM, C0_H ~ .3g uM) ===\n', ...
+        best.s, 0.365/best.s, 3.15/best.s);
+fprintf('c1 = .4g    c2 = .4g\n\n', best.c(1), best.c(2));
+print_table(best);
+if ~isempty(base) && kb ~= find(s_list == 1, 1)
+    fprintf('\n--- For comparison, s = 1 (Table 2) ---\n');
+    print_table(base);
+end
+
+ Plots
+cols = lines(nC);
+
+figure('Name', 'RMS vs s');
+plot(s_list, rms_s, 'ko-', 'LineWidth', 1.5);
+xlabel('Concentration scale s'); ylabel('Weighted RMS residual');
+title('Global affine fit quality vs s'); grid on;
+try
+    exportgraphics(gcf, 'fig_S1_sscan.pdf', 'ContentType', 'vector');
+    exportgraphics(gcf, 'fig_S1_sscan.png', 'Resolution', 300);
+catch
+    set(gcf, 'PaperPositionMode', 'auto');
+    print(gcf, 'fig_S1_sscan', '-dpdf', '-painters');
+    print(gcf, 'fig_S1_sscan', '-dpng', '-r300');
+end
+
+for which = unique([1, kb])
+    if isempty(base) && which == 1, continue; end
+    Rk = R{which};
+    c1 = Rk.c(1); c2 = Rk.c(2); D = Rk.D;
+    figure('Name', sprintf('Model vs SLS, s = .2g', Rk.s), ...
+           'Position', [100 100 1200 450]);
+    for panel = 1:2
+        subplot(1, 2, panel); hold on;
+        for j = 1:nC
+            plot(D(j).t, D(j).y, '-', 'Color', [cols(j,:) 0.25], ...
+                 'HandleVisibility', 'off');
+            plot(D(j).t_model, c1*D(j).Mw_model + c2, '-', 'Color', cols(j,:), ...
+                 'LineWidth', 1.5, 'DisplayName', sprintf('.2g \\muM', D(j).C0));
+        end
+        ylim([3000 9000]); grid on;
+        xlabel('Time (min)'); ylabel('SLS signal');
+        if panel == 1
+            title(sprintf('s = .2g:  SLS = .3g M_w + .3g', Rk.s, c1, c2));
+            legend('Location', 'northeast');
+        else
+            xlim([0 200]); title('First 200 min');
+        end
+    end
+end
+
+ Long-term level vs C0 for nonmonotonic dependence
+figure('Name', 'Long-term level vs C0'); hold on;
+lt_data = arrayfun(@(d) d.late_data, best.D);
+plot(C0_list, lt_data, 'ko-', 'LineWidth', 2, 'MarkerFaceColor', 'k', ...
+     'DisplayName', 'data');
+if ~isempty(base)
+    plot(C0_list, base.c(1)*arrayfun(@(d) d.late_model, base.D) + base.c(2), ...
+         's--', 'LineWidth', 1.2, 'DisplayName', 'model, s = 1');
+end
+if kb ~= find(s_list == 1, 1)
+    plot(C0_list, best.c(1)*arrayfun(@(d) d.late_model, best.D) + best.c(2), ...
+         'd-', 'LineWidth', 1.5, 'DisplayName', sprintf('model, s = .2g', best.s));
+end
+set(gca, 'XScale', 'log'); grid on;
+xlabel('C_0 (\muM)'); ylabel(sprintf('SLS, last d of each run', round(100*late_frac)));
+title('Long-term level vs concentration'); legend('Location', 'best');
+
+ Affine check for the best s
+figure('Name', 'Affine check'); hold on;
+allM = [];
+for j = 1:nC
+    scatter(best.D(j).Mwb, best.D(j).yb, 12, cols(j,:), 'filled', ...
+            'DisplayName', sprintf('.2g \\muM', best.D(j).C0));
+    allM = [allM; best.D(j).Mwb]; #ok<AGROW>
+end
+xx = linspace(min(allM), max(allM), 2);
+plot(xx, best.c(1)*xx + best.c(2), 'k-', 'LineWidth', 1.5, 'DisplayName', 'global fit');
+xlabel('Model M_w (binned)'); ylabel('SLS (binned median)');
+title(sprintf('Binned data vs model M_w, s = %.2g', best.s));
+legend('Location', 'best'); grid on;
+
+%% Functions
+
+% rates rescaling
+function D = simulate_all(s, data, p, s1, s2, opt)
+    q = p;
+    q.alpha = p.alpha*s;  q.lambda = p.lambda*s;
+    q.rho = p.rho*s^2;    q.sigma = p.sigma*s^2;  q.beta = p.beta*s^2;
+    a1 = s1;  a1.k = s1.k*s;  a1.tau = s1.tau*s^2;
+    a2 = s2;  a2.k = s2.k*s;  a2.tau = s2.tau*s^2;
+    M0 = opt.M0;  if opt.scale_M0, M0 = opt.M0/s; end
+
+    N = opt.N;  nT = 2; n1 = 6; n2 = 12;
+    sizes = [nT, n1, n2 + nT*(0:N-1)];
+    Mw_of = @(Y, C0) (C0 - sizes*Y + (sizes.^2)*Y) / C0;
+    binmed = @(t, v, edges) accumarray(discretize(t, edges), v, ...
+                                       [numel(edges)-1, 1], @median, NaN);
+    binavg = @(t, v, edges) accumarray(discretize(t, edges), v, ...
+                                       [numel(edges)-1, 1], @mean, NaN);
+
+    % stage 1 (once per s)
+    F1 = @(t, Z) F_ode(Z, M0, n1, n2, N, q.alpha, q.sigma, q.rho, q.omega, ...
+                       q.beta, q.mu, q.lambda, a1.gamma, a1.tau, a1.delta, a1.k);
+    [~, Y1] = ode15s(F1, [0 opt.T1], zeros(N+2, 1), opt.odeopts);
+    z = Y1(end, :).';  z(1:2) = 0;  z = z / (sizes * z);
+
+    D = data;
+    for j = 1:numel(data)
+        C0 = data(j).C0;
+        tmax = min(max(data(j).t), opt.t_end);
+        F2 = @(t, Z) F_ode(Z, C0, n1, n2, N, q.alpha, q.sigma, q.rho, q.omega, ...
+                           q.beta, q.mu, q.lambda, a2.gamma, a2.tau, a2.delta, a2.k);
+        sol = ode15s(F2, [0 tmax], z*C0, opt.odeopts);
+
+        tf = (0:opt.dt_fine:tmax).';
+        Mw_f = Mw_of(deval(sol, tf.'), C0).';
+        D(j).t_model = tf;  D(j).Mw_model = Mw_f;
+
+        edges = opt.t_skip:opt.bin_w:tmax;
+        in_d = data(j).t >= edges(1) & data(j).t < edges(end);
+        in_m = tf        >= edges(1) & tf        < edges(end);
+        yb  = binmed(data(j).t(in_d), data(j).y(in_d), edges);   % robust to spikes
+        Mwb = binavg(tf(in_m), Mw_f(in_m), edges);               % smooth model
+        keep = ~isnan(yb) & ~isnan(Mwb);
+        tb = edges(1:end-1).' + opt.bin_w/2;
+        D(j).tb = tb(keep);  D(j).yb = yb(keep);  D(j).Mwb = Mwb(keep);
+
+        % long-term level: last late_frac of the run
+        t_late = tmax*(1 - opt.late_frac);
+        D(j).late_data  = median(data(j).y(data(j).t >= t_late));
+        D(j).late_model = mean(Mw_f(tf >= t_late));
+    end
+end
+
+function [c, rms_tot, per] = global_fit(D, equal_w)
+    A = []; b = []; w = [];
+    for j = 1:numel(D)
+        n = numel(D(j).yb);
+        A = [A; D(j).Mwb, ones(n, 1)];
+        b = [b; D(j).yb];
+        if equal_w, w = [w; ones(n,1)/sqrt(n)];
+        else,       w = [w; ones(n,1)];
+        end
+    end
+    c = (A .* w) \ (b .* w);
+    r = (A*c - b) .* w;
+    rms_tot = sqrt(sum(r.^2) / sum(w.^2));
+
+    per = struct('C0', {}, 'rmse', {}, 'c_own', {}, 'mean_data', {}, ...
+                 'mean_fit', {}, 'late_data', {}, 'late_fit', {});
+    for j = 1:numel(D)
+        yb = D(j).yb;  fit = c(1)*D(j).Mwb + c(2);
+        per(j).C0 = D(j).C0;
+        per(j).rmse = sqrt(mean((yb - fit).^2));
+        per(j).c_own = [D(j).Mwb, ones(numel(yb),1)] \ yb;
+        per(j).mean_data = mean(yb);   per(j).mean_fit = mean(fit);
+        per(j).late_data = D(j).late_data;
+        per(j).late_fit  = c(1)*D(j).late_model + c(2);
+    end
+end
+
+function print_table(Rk)
+    fprintf('%6s | %8s | %9s %9s | %10s %10s | %10s %10s\n', 'C0', 'RMSE', ...
+            'c1_own', 'c2_own', 'mean data', 'mean fit', 'late data', 'late fit');
+    for j = 1:numel(Rk.per)
+        q = Rk.per(j);
+        fprintf('%6.2f | %8.3g | %9.3g %9.3g | %10.4g %10.4g | %10.4g %10.4g\n', ...
+                q.C0, q.rmse, q.c_own(1), q.c_own(2), q.mean_data, q.mean_fit, ...
+                q.late_data, q.late_fit);
+    end
+end
