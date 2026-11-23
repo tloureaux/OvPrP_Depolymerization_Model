@@ -1,0 +1,296 @@
+clear; clc;
+warning('off', 'MATLAB:ode15s:IntegrationTolNotMet');
+
+%% Settings
+dataFile  = 'SLS Data O1.xlsx';
+C0_list   = [8 6 4 2 1 0.5 0.41];
+C_low     = 0.5;
+C_high    = 8;
+
+n_samples = 10000;
+fac       = 10;           % rates sampled in [x/fac, x*fac]
+s_range   = [1 5];        % concentration scale
+require_heating = true;   % true: phase-2 rate = phase-1 rate x U_log[1, heat_max]
+heat_max  = 25;
+use_parallel = false;     % true: parfor over samples
+
+% Hit criteria
+min_depth    = 0.02;      % relative dip below the plateau
+min_rebound  = 0.02;      % relative rise above the plateau after the dip
+t_min_range  = [10 30];   % time of the minimum
+t_max_limit  = 120;       % maximum must come before this
+osc_max      = 0.02;      % relative peak-to-peak over plateau_win above which a
+                          % sample is a SUSTAINED OSCILLATION
+
+% Simulation
+T_end       = 200;
+t_skip      = 2;
+plateau_win = [150 200];
+smooth_win  = 3;          % removes the ~1 min limit cycle
+dt_fine     = 0.05;       
+max_sec     = 20;         % s, wall-clock limit per ODE solve
+N = 100;  M0 = 100;  T1 = 300;
+odeopts = odeset('RelTol', 1e-6, 'AbsTol', 1e-9);
+
+% Table 2
+names = {'alpha','rho','omega','sigma','beta','mu','lambda', ...
+         'gamma1','tau1','delta1','k1','gamma2','tau2','delta2','k2'};
+base  = [1e-2, 0.7, 0.1, 1e-4, 150, 0.01, 230, ...
+         5, 0.1, 0.1, 10, 8, 0.8, 0.8, 250];
+nP = numel(names);
+pairs = [8 12; 9 13; 10 14; 11 15];   % (phase-1 index, phase-2 index)
+
+%% Data targets
+raw = readmatrix(dataFile);
+binmed = @(t, v, e) accumarray(discretize(t, e), v, [numel(e)-1, 1], @median, NaN);
+tgt = struct();
+for Cc = [C_low, C_high]
+    j = find(abs(C0_list - Cc) < 1e-9, 1);
+    t = raw(:, 2*j-1);  y = raw(:, 2*j);
+    ok = ~isnan(t) & ~isnan(y);  t = t(ok);  y = y(ok);
+    e  = 0:1:min(T_end, max(t));
+    in = t >= e(1) & t < e(end);
+    yb = binmed(t(in), y(in), e);  tb = e(1:end-1).' + 0.5;
+    k  = ~isnan(yb);  tb = tb(k);  yb = yb(k);
+    y0 = median(y(t <= 1));
+    f  = shape_features([0; tb], [y0; yb], y0, t_skip, plateau_win);
+    f.tb = tb;  f.yn = (yb - f.plateau) / (y0 - f.plateau);   % normalized curve
+    tgt.(sprintf('C%g', round(10*Cc))) = f;
+end
+tL = tgt.(sprintf('C%g', round(10*C_low)));
+tH = tgt.(sprintf('C%g', round(10*C_high)));
+fprintf('Data %.2g uM: depth %.3f, t_min %.1f, rebound %.3f, t_max %.1f\n', ...
+        C_low, tL.rel_depth, tL.t_min, tL.rel_rebound, tL.t_max);
+fprintf('Data %.2g uM: depth %.3f, t_min %.1f, rebound %.3f, t_max %.1f\n\n', ...
+        C_high, tH.rel_depth, tH.t_min, tH.rel_rebound, tH.t_max);
+
+%% Sampling
+rng(2);
+nD = nP + 1;                                   % + s
+if exist('lhsdesign', 'file') == 2
+    U = lhsdesign(n_samples, nD);
+else
+    warning('lhsdesign not found: using plain uniform sampling.');
+    U = rand(n_samples, nD);
+end
+
+logP = zeros(n_samples, nP);
+for i = 1:nP
+    logP(:, i) = log(base(i)) + (2*U(:, i) - 1) * log(fac);
+end
+if require_heating
+    for r = 1:size(pairs, 1)
+        i1 = pairs(r, 1);  i2 = pairs(r, 2);
+        logP(:, i2) = logP(:, i1) + U(:, i2) * log(heat_max);
+    end
+end
+P = exp(logP);
+s_all = exp(log(s_range(1)) + U(:, nD) * log(s_range(2)/s_range(1)));
+
+%% Runs
+ctx.N = N;  ctx.M0 = M0;  ctx.T1 = T1;  ctx.T_end = T_end;  ctx.dt = dt_fine;
+ctx.sizes = [2, 6, 12 + 2*(0:N-1)];
+ctx.odeopts = odeopts;  ctx.max_sec = max_sec;
+ctx.t_skip = t_skip;  ctx.pw = plateau_win;  ctx.sw = smooth_win;
+
+F  = nan(n_samples, 5);       % [rel_depth, t_min, rel_rebound, t_max, rel_osc] at C_low
+st = zeros(n_samples, 1);     % 1 = ok, 0 = solver failed / timed out
+fprintf('Simulating %d parameter sets at %.2g uM ...\n', n_samples, C_low);
+tic;
+if use_parallel
+    parfor n = 1:n_samples
+        [F(n,:), st(n)] = run_one(P(n,:), s_all(n), C_low, ctx);
+    end
+else
+    for n = 1:n_samples
+        [F(n,:), st(n)] = run_one(P(n,:), s_all(n), C_low, ctx);
+        if mod(n, 100) == 0
+            fprintf('  %d / %d  (%.0f s, %d hits so far)\n', n, n_samples, toc, ...
+                    sum(is_hit(F(1:n,:), min_depth, min_rebound, t_min_range, t_max_limit, osc_max)));
+        end
+    end
+end
+fprintf('Done in %.0f s.\n\n', toc);
+
+%% Classification
+osc = st == 1 & F(:,5) > osc_max;                     % sustained oscillation
+hit = is_hit(F, min_depth, min_rebound, t_min_range, t_max_limit, osc_max) & st == 1;
+dip_only  = st == 1 & ~osc & F(:,1) > min_depth & ~hit;
+bump_only = st == 1 & ~osc & F(:,3) > min_rebound & F(:,1) <= min_depth;
+nok = sum(st == 1);
+
+fprintf('=== Summary at %.2g uM (heating constraint: %d) ===\n', C_low, require_heating);
+fprintf('valid simulations   : %d / %d\n', nok, n_samples);
+fprintf('dip-then-rise hits  : %d  (%.2f%% of valid)\n', sum(hit), 100*sum(hit)/max(nok,1));
+fprintf('dip only            : %d\n', sum(dip_only));
+fprintf('rise only           : %d\n', sum(bump_only));
+fprintf('sustained oscillation: %d\n', sum(osc));
+fprintf('monotone            : %d\n', nok - sum(hit) - sum(dip_only) - sum(bump_only) - sum(osc));
+
+% distance to the data shape
+dist = inf(n_samples, 1);
+hh = find(hit);
+dist(hh) = abs(log(F(hh,1)/tL.rel_depth)) + abs(log(F(hh,3)/tL.rel_rebound)) + ...
+           abs(F(hh,2) - tL.t_min)/tL.t_min + abs(F(hh,4) - tL.t_max)/tL.t_max;
+[~, order] = sort(dist);
+n_show = min(10, numel(hh));
+
+% Hits at C_high
+FH = nan(n_samples, 5);
+if ~isempty(hh)
+    fprintf('\nChecking the %d hits at %.2g uM ...\n', numel(hh), C_high);
+    for n = hh.'
+        FH(n, :) = run_one(P(n,:), s_all(n), C_high, ctx);
+    end
+    keep_high = hit & FH(:,1) > min_depth;
+    fprintf('hits that ALSO show an undershoot at %.2g uM: %d\n', C_high, sum(keep_high));
+
+    fprintf('\nClosest hits to the %.2g uM data shape:\n', C_low);
+    fprintf('%5s %6s | %7s %6s %7s %6s | %7s %6s | %6s\n', '#', 's', ...
+            'depth', 't_min', 'rebnd', 't_max', 'dep8', 'tmin8', 'dist');
+    for r = 1:n_show
+        n = order(r);
+        fprintf('%5d %6.2f | %7.3f %6.1f %7.3f %6.1f | %7.3f %6.1f | %6.2f\n', n, ...
+                s_all(n), F(n,1), F(n,2), F(n,3), F(n,4), FH(n,1), FH(n,2), dist(n));
+    end
+    fprintf('(data: depth %.3f, t_min %.1f, rebound %.3f, t_max %.1f; 8 uM depth %.3f)\n', ...
+            tL.rel_depth, tL.t_min, tL.rel_rebound, tL.t_max, tH.rel_depth);
+
+    % Parameter trends
+    fprintf('\nMedian log10(parameter / Table 2) among hits vs all valid samples:\n');
+    fprintf('%8s | %7s %7s | %s\n', 'param', 'hits', 'all', 'shift');
+    allv = st == 1;
+    for i = 1:nP
+        mh = median(log10(P(hit, i) / base(i)));
+        ma = median(log10(P(allv, i) / base(i)));
+        mark = '';  if abs(mh - ma) > 0.3, mark = '<--'; end
+        fprintf('%8s | %7.2f %7.2f | %s\n', names{i}, mh, ma, mark);
+    end
+    mh = median(log10(s_all(hit)));  ma = median(log10(s_all(allv)));
+    fprintf('%8s | %7.2f %7.2f | %s\n', 's', mh, ma, repmat('<--', 1, abs(mh-ma) > 0.3));
+    fprintf('(|shift| > 0.3 decades marked: the hits need that parameter changed)\n');
+else
+    fprintf('\nNo parameter set in the sampled window produces the dip-then-bump.\n');
+end
+
+resname = sprintf('global_sample_lowC0_result_heat%d.mat', require_heating);
+save(resname, 'names', 'base', 'P', 's_all', 'F', 'FH', 'st', 'hit', 'osc', ...
+     'dip_only', 'bump_only', 'dist', 'tL', 'tH', 'fac', 's_range', 'require_heating');
+fprintf('\nSaved to %s\n', resname);
+
+%% Figures
+figure('Name', 'Shape space at low C0', 'Position', [80 80 1100 450]);
+subplot(1, 2, 1); hold on;
+v = st == 1 & ~osc;
+scatter(F(v,1), F(v,3), 10, F(v,2), 'filled', 'MarkerFaceAlpha', 0.5);
+cb = colorbar; ylabel(cb, 't_{min} (min)'); caxis([0 150]);
+if any(osc)
+    plot(F(osc,1), F(osc,3), 'x', 'Color', [0.5 0.5 0.5], 'MarkerSize', 4);
+end
+plot(tL.rel_depth, tL.rel_rebound, 'kp', 'MarkerSize', 16, 'MarkerFaceColor', 'y');
+xline(min_depth, 'k:');  yline(min_rebound, 'k:');
+xlabel('relative dip below plateau');  ylabel('relative rebound above plateau');
+title(sprintf('%d samples at %.2g \\muM (star: data, x: sustained oscillation)', nok, C_low));
+grid on;
+va = st == 1;
+xl = prctile(F(va,1), [1 99]);  yl = prctile(F(va,3), [1 99]);
+xlim([min(xl(1), -0.05), max([xl(2), 1.5*tL.rel_depth, 0.1])]);
+ylim([min(yl(1), -0.05), max([yl(2), 1.5*tL.rel_rebound, 0.1])]);
+
+subplot(1, 2, 2); hold on;
+plot(tL.tb, tL.yn, 'k.', 'MarkerSize', 8, 'DisplayName', sprintf('data %.2g \\muM', C_low));
+cols = lines(max(n_show, 1));
+for r = 1:n_show
+    n = order(r);
+    [~, ~, tf, yn] = run_one(P(n,:), s_all(n), C_low, ctx);
+    plot(tf, yn, '-', 'Color', cols(r,:), 'LineWidth', 1.2, 'DisplayName', sprintf('#%d', n));
+end
+yline(0, 'k:', 'HandleVisibility', 'off');
+xlim([0 T_end]); grid on; legend('Location', 'northeast');
+xlabel('Time (min)'); ylabel('(signal - plateau) / (initial - plateau)');
+title('Normalized shape: data vs closest hits');
+if n_show == 0, text(20, 0.5, 'no hits', 'FontSize', 14); end
+
+%% Functions
+
+function h = is_hit(F, dmin, rmin, trange, tmaxlim, oscmax)
+    h = F(:,1) > dmin & F(:,3) > rmin & F(:,2) >= trange(1) & F(:,2) <= trange(2) ...
+        & F(:,4) > F(:,2) & F(:,4) <= tmaxlim & F(:,5) <= oscmax;
+end
+
+function [feat, ok, tf, yn] = run_one(p, s, C, ctx)
+    % p: 15 unscaled rates in the order of `names`; s: concentration scale
+    feat = nan(1, 5);  ok = 0;  tf = [];  yn = [];
+    try
+        q = num2cell(p);
+        [alpha, rho, omega, sigma, beta, mu, lambda, ...
+         gamma1, tau1, delta1, k1, gamma2, tau2, delta2, k2] = q{:};
+        % concentration scaling
+        alpha = alpha*s;  lambda = lambda*s;  k1 = k1*s;  k2 = k2*s;
+        rho = rho*s^2;  sigma = sigma*s^2;  beta = beta*s^2;
+        tau1 = tau1*s^2;  tau2 = tau2*s^2;
+
+        N = ctx.N;  sizes = ctx.sizes;
+
+        % stage 1 at M0/s (same P1 composition as unscaled rates at M0)
+        M0 = ctx.M0 / s;
+        F1 = @(t, Z) F_ode(Z, M0, 6, 12, N, alpha, sigma, rho, omega, beta, mu, ...
+                           lambda, gamma1, tau1, delta1, k1);
+        o1 = odeset(ctx.odeopts, 'OutputFcn', timeout_fcn(ctx.max_sec));
+        sol1 = ode15s(F1, [0 ctx.T1], zeros(N+2, 1), o1);
+        if sol1.x(end) < ctx.T1*(1 - 1e-9), return; end
+        z = sol1.y(:, end);  z(1:2) = 0;
+        mz = sizes * z;
+        if ~(mz > 0) || any(~isfinite(z)), return; end
+        z = z / mz;
+
+        % stage 2 at C
+        F2 = @(t, Z) F_ode(Z, C, 6, 12, N, alpha, sigma, rho, omega, beta, mu, ...
+                           lambda, gamma2, tau2, delta2, k2);
+        o2 = odeset(ctx.odeopts, 'OutputFcn', timeout_fcn(ctx.max_sec));
+        sol2 = ode15s(F2, [0 ctx.T_end], z*C, o2);
+        if sol2.x(end) < ctx.T_end*(1 - 1e-9), return; end
+
+        tf  = (0:ctx.dt:ctx.T_end).';
+        Y   = deval(sol2, tf.');
+        Mwf = ((C - sizes*Y + (sizes.^2)*Y) / C).';
+        if any(~isfinite(Mwf)), return; end
+        Ms  = movmean(Mwf, round(ctx.sw/ctx.dt));
+        f   = shape_features(tf, Ms, Mwf(1), ctx.t_skip, ctx.pw);
+        % sustained oscillation: smoothed peak-to-peak over the plateau window,
+        % relative to the initial drop
+        ip  = tf >= ctx.pw(1) & tf <= ctx.pw(2);
+        osc_rel = (max(Ms(ip)) - min(Ms(ip))) / abs(Mwf(1) - f.plateau);
+        feat = [f.rel_depth, f.t_min, f.rel_rebound, f.t_max, osc_rel];
+        yn = (Ms - f.plateau) / (Mwf(1) - f.plateau);
+        ok = all(isfinite(feat));
+    catch
+        ok = 0;
+    end
+end
+
+function fcn = timeout_fcn(max_sec)
+    t0 = tic;
+    fcn = @(t, y, flag) ~isempty(t) && isempty(flag) && toc(t0) > max_sec;
+end
+
+function f = shape_features(t, y, y0, t_skip, pw)
+    f = struct('plateau', NaN, 'rel_depth', NaN, 't_min', NaN, ...
+               'rel_rebound', NaN, 't_max', NaN);
+    if all(isnan(y)), return; end
+    pl = mean(y(t >= pw(1) & t <= pw(2)), 'omitnan');
+    drop = y0 - pl;
+    if ~isfinite(drop) || abs(drop) < eps, return; end
+    idx = find(t >= t_skip & t < pw(1));
+    [ymin, im] = min(y(idx));
+    tmin = t(idx(im));
+    after = idx(t(idx) > tmin);
+    if isempty(after), ymax = ymin; tmax = tmin;
+    else, [ymax, ia] = max(y(after)); tmax = t(after(ia));
+    end
+    f.plateau = pl;
+    f.rel_depth   = (pl - ymin) / drop;
+    f.t_min       = tmin;
+    f.rel_rebound = (ymax - pl) / drop;
+    f.t_max       = tmax;
+end
