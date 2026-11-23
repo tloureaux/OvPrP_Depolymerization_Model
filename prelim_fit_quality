@@ -127,7 +127,7 @@ allM = [];
 for j = 1:nC
     scatter(best.D(j).Mwb, best.D(j).yb, 12, cols(j,:), 'filled', ...
             'DisplayName', sprintf('.2g \\muM', best.D(j).C0));
-    allM = [allM; best.D(j).Mwb]; #ok<AGROW>
+    allM = [allM; best.D(j).Mwb];
 end
 xx = linspace(min(allM), max(allM), 2);
 plot(xx, best.c(1)*xx + best.c(2), 'k-', 'LineWidth', 1.5, 'DisplayName', 'global fit');
