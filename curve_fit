@@ -1,0 +1,304 @@
+clear; clc;
+warning('off', 'MATLAB:ode15s:IntegrationTolNotMet');
+
+%% Settings
+dataFile = 'SLS Data O1.xlsx';
+C0_list  = [8 6 4 2 1 0.5 0.41];
+
+M0 = 100;  T1 = 300;     % stage 1
+N  = 100;
+s_bounds = [1 5];
+
+t_skip  = 2;
+T_fit   = 200;
+bin_w   = 2;             % median bins
+bin_feat = 1;            % bins used for the data shape features
+plateau_win = [150 200]; % plateau for the shape features and long-term level
+smooth_win  = 3;         % moving average on the model before measuring shape
+dt_fine = 0.05;
+thr_sls   = 30;          % smallest dip / rebound counted (~2x noise)
+thr_drift = 50;          % drift over plateau_win above which a curve is "not settled"
+disp_bin  = 0.2;         % raw data downsampled to these medians for display only
+
+p = struct('alpha',1e-2,'rho',0.7,'omega',0.1,'sigma',1e-4,'beta',150, ...
+           'mu',0.01,'lambda',230,'gamma1',5,'tau1',0.1,'delta1',0.1,'k1',10, ...
+           'gamma2',8,'tau2',0.8,'delta2',0.8,'k2',250);
+
+fs  = 10;
+out_A = 'fig_model_vs_data';
+out_B = 'fig_model_captures';
+odeopts = odeset('RelTol', 1e-7, 'AbsTol', 1e-10);
+
+%% Data
+raw = readmatrix(dataFile);
+nC  = numel(C0_list);
+binmed = @(t, v, e) accumarray(discretize(t, e), v, [numel(e)-1, 1], @median, NaN);
+D = struct('C0', {}, 't', {}, 'y', {}, 'y0', {}, 'edges', {}, 'keep', {}, ...
+           'tb', {}, 'yb', {}, 'w', {}, 'feat', {}, 'osc', {}, 'late', {});
+for j = 1:nC
+    t = raw(:, 2*j-1);  y = raw(:, 2*j);
+    ok = ~isnan(t) & ~isnan(y);  t = t(ok);  y = y(ok);
+    D(j).C0 = C0_list(j);  D(j).t = t;  D(j).y = y;
+    D(j).y0 = median(y(t <= 1));
+
+    % fit bins
+    e  = t_skip:bin_w:min(T_fit, max(t));
+    in = t >= e(1) & t < e(end);
+    yb = binmed(t(in), y(in), e);
+    keep = ~isnan(yb);
+    tb = e(1:end-1).' + bin_w/2;
+    D(j).edges = e;  D(j).keep = keep;  D(j).tb = tb(keep);  D(j).yb = yb(keep);
+    n = sum(keep);  D(j).w = ones(n, 1) / sqrt(n);
+
+    % shape features and descriptive fit on 1-min bins
+    e1 = 0:bin_feat:min(T_fit, max(t));
+    in1 = t >= e1(1) & t < e1(end);
+    y1 = binmed(t(in1), y(in1), e1);  t1 = e1(1:end-1).' + bin_feat/2;
+    k1 = ~isnan(y1);  t1 = t1(k1);  y1 = y1(k1);
+    D(j).feat = shape_features([0; t1], [D(j).y0; y1], D(j).y0, t_skip, plateau_win);
+    D(j).afeat = abs_features(t1, y1, t_skip, plateau_win, thr_sls);
+
+    % raw data downsampled for display
+    ed = 0:disp_bin:max(t);
+    ydd = binmed(t(t < ed(end)), y(t < ed(end)), ed);
+    D(j).td = ed(1:end-1).' + disp_bin/2;  D(j).yd = ydd;
+    w = t1 >= t_skip;
+    D(j).osc  = fit_damped(t1(w), y1(w));
+    D(j).late = median(y(t >= plateau_win(1) & t <= plateau_win(2)));
+end
+
+%% Stage 1
+sizes = [2, 6, 12 + 2*(0:N-1)];
+ctx = struct('N', N, 'sizes', sizes, 'odeopts', odeopts, 'dt', dt_fine, 'p', p);
+F1 = @(t, Z) F_ode(Z, M0, 6, 12, N, p.alpha, p.sigma, p.rho, p.omega, p.beta, ...
+                   p.mu, p.lambda, p.gamma1, p.tau1, p.delta1, p.k1);
+[~, Y1] = ode15s(F1, [0 T1], zeros(N+2, 1), odeopts);
+z = Y1(end, :).';  z(1:2) = 0;  z = z / (sizes*z);
+ctx.z = z;
+
+%% Fit s
+obj = @(ls) global_rms(exp(ls), D, ctx);
+fopt = optimset('TolX', 1e-3, 'Display', 'iter');
+tic;
+[ls_best, rms_best] = fminbnd(obj, log(s_bounds(1)), log(s_bounds(2)), fopt);
+s = exp(ls_best);
+[rms_best, c, Mfine] = global_rms(s, D, ctx);
+fprintf('\nBest s = %.3f  (weighted RMS = %.1f, %.0f s)\n', s, rms_best, toc);
+[rms1, c1fit] = global_rms(1, D, ctx);
+fprintf('For reference, s = 1: weighted RMS = %.1f (c1 = %.3g, c2 = %.4g)\n', rms1, c1fit);
+if abs(ls_best - log(s_bounds(1))) < 1e-2 || abs(ls_best - log(s_bounds(2))) < 1e-2
+    warning('s is at a bound: widen s_bounds.');
+end
+fprintf('c1 = %.4g, c2 = %.4g\n', c(1), c(2));
+fprintf('Bifurcation points in experimental units: C0_cr ~ %.3g, C0_H ~ %.3g uM\n', ...
+        0.365/s, 3.15/s);
+
+%% Per-curve numbers
+% Features in SLS units (model mapped with the fitted c1, c2), so comparison on same scaling
+fprintf(['\nFeatures in SLS units, from the first local minimum after the drop ' ...
+         '(prominence >= %g; dip/rebound below %g set to 0)\n'], thr_sls, thr_sls);
+fprintf('%6s | %6s | %7s %7s | %6s %6s | %6s %6s | %6s %6s | %6s %s\n', 'C0', 'RMSE', ...
+        'lvl d', 'lvl m', 'dip d', 'dip m', 'tmn d', 'tmn m', 'reb d', 'reb m', ...
+        'drift', 'settled?');
+M = struct('afeat', cell(nC,1), 'late', NaN, 'rmse', NaN, 'drift', NaN, 'settled', true);
+for j = 1:nC
+    tf = Mfine{j}.t;  Mwf = Mfine{j}.Mw;
+    in = tf >= D(j).edges(1) & tf < D(j).edges(end);
+    mb = accumarray(discretize(tf(in), D(j).edges), Mwf(in), ...
+                    [numel(D(j).edges)-1, 1], @mean, NaN);
+    mb = mb(D(j).keep);
+    M(j).rmse = sqrt(mean((c(1)*mb + c(2) - D(j).yb).^2, 'omitnan'));
+
+    w0  = tf <= T_fit;
+    ySm = c(1)*movmean(Mwf(w0), round(smooth_win/dt_fine)) + c(2);   % model in SLS units
+    M(j).afeat = abs_features(tf(w0), ySm, t_skip, plateau_win, thr_sls);
+    M(j).late  = M(j).afeat.plateau;
+    M(j).drift = M(j).afeat.drift;
+    M(j).settled = abs(M(j).drift) <= thr_drift;
+
+    fd = D(j).afeat;  fm = M(j).afeat;
+    st = 'yes';  if ~M(j).settled, st = 'NO'; end
+    fprintf('%6.2f | %6.0f | %7.0f %7.0f | %6.0f %6.0f | %6.1f %6.1f | %6.0f %6.0f | %6.0f %s\n', ...
+            D(j).C0, M(j).rmse, fd.plateau, fm.plateau, fd.dip, fm.dip, fd.t_min, fm.t_min, ...
+            fd.rebound, fm.rebound, fm.drift, st);
+end
+fprintf('(drift = model change over the plateau window, SLS units)\n');
+
+%% Data table
+fprintf('\n=== Data: transient features (table for the paper) ===\n');
+fprintf('%6s | %7s %8s %8s | %9s %9s | %7s %7s %7s\n', 'C0', 't_min', 'dip', 'rebound', ...
+        'rel_dip', 'rel_reb', 'tau2', 'T', 'dAIC');
+Tab = zeros(nC, 9);
+for j = 1:nC
+    f = D(j).feat;  a = D(j).afeat;  o = D(j).osc;
+    Tab(j,:) = [D(j).C0, a.t_min, a.dip, a.rebound, f.rel_depth, f.rel_rebound, ...
+                o.p(5), o.p(6), o.dAIC];
+    fprintf('%6.2f | %7.1f %8.0f %8.0f | %9.3f %9.3f | %7.1f %7.1f %7.0f\n', Tab(j,:));
+end
+writetable(array2table(Tab, 'VariableNames', {'C0_uM','t_min_min','dip_SLS', ...
+           'rebound_SLS','rel_dip','rel_rebound','tau2_min','T_min','dAIC'}), ...
+           'data_features.csv');
+fprintf('(dip, rebound in SLS units; rel_ = divided by the initial drop)\n');
+fprintf('(t_min is NaN when the curve has no dip below its plateau)\n');
+fprintf('Saved data_features.csv\n');
+
+save('model_vs_data_result.mat', 's', 'c', 'rms_best', 'rms1', 'M', 'Tab', 'p', 'M0', 'T1');
+
+%% Figure: model vs. table
+cols = lines(nC);
+col_raw = [0.72 0.72 0.72];
+yall = vertcat(D.yb);
+ylo = floor(min(yall)/500)*500;  yhi = ceil(max([yall; vertcat(D.y0)])/500)*500;
+
+figA = figure('Color', 'w', 'Position', [50 50 1300 560]);
+tlA = tiledlayout(figA, 2, 4, 'TileSpacing', 'compact', 'Padding', 'compact');
+for j = 1:nC
+    ax = nexttile(tlA); hold(ax, 'on');
+    plot(ax, D(j).td, D(j).yd, '-', 'Color', col_raw, 'LineWidth', 1.2, 'HandleVisibility', 'off');
+    plot(ax, D(j).tb, D(j).yb, 'k.', 'MarkerSize', 5, 'DisplayName', 'data (2-min medians)');
+    plot(ax, Mfine{j}.t, c(1)*Mfine{j}.Mw + c(2), '-', 'Color', cols(j,:)*0.75, ...
+         'LineWidth', 1.8, 'DisplayName', 'model');
+    xlim(ax, [0 T_fit]);  ylim(ax, [ylo yhi]);  grid(ax, 'on');  box(ax, 'on');
+    title(ax, sprintf('C_0 = %.2g \\muM', D(j).C0), 'FontWeight', 'normal', 'FontSize', fs+1);
+    if j > 3, xlabel(ax, 'time (min)'); end
+    if mod(j, 4) == 1, ylabel(ax, 'SLS signal'); end
+    set(ax, 'FontSize', fs);
+end
+axL = nexttile(tlA); axis(axL, 'off'); hold(axL, 'on');
+plot(axL, NaN, NaN, 'k.', 'MarkerSize', 12, 'DisplayName', 'data (2-min medians)');
+plot(axL, NaN, NaN, '-', 'Color', [0.4 0.4 0.4], 'LineWidth', 1.8, 'DisplayName', 'model');
+plot(axL, NaN, NaN, '-', 'Color', col_raw, 'LineWidth', 1.2, 'DisplayName', 'raw data');
+legend(axL, 'Location', 'north', 'FontSize', fs+1, 'Box', 'off');
+export_both(figA, out_A);
+
+%% Functions
+
+function [rms_tot, c, Mfine] = global_rms(s, D, ctx)
+    % simulate all curves at scale s, solve c1, c2, return the weighted RMS
+    p = ctx.p;  q = p;
+    q.alpha = p.alpha*s;  q.lambda = p.lambda*s;  q.k2 = p.k2*s;
+    q.rho = p.rho*s^2;  q.sigma = p.sigma*s^2;  q.beta = p.beta*s^2;  q.tau2 = p.tau2*s^2;
+    A = [];  b = [];  w = [];
+    Mfine = cell(numel(D), 1);
+    for j = 1:numel(D)
+        C = D(j).C0;  tmax = max(D(j).edges(end), 200);
+        F2 = @(t, Z) F_ode(Z, C, 6, 12, ctx.N, q.alpha, q.sigma, q.rho, q.omega, ...
+                           q.beta, q.mu, q.lambda, q.gamma2, q.tau2, q.delta2, q.k2);
+        sol = ode15s(F2, [0 tmax], ctx.z*C, ctx.odeopts);
+        tf  = (0:ctx.dt:sol.x(end)).';
+        Y   = deval(sol, tf.');
+        Mw  = ((C - ctx.sizes*Y + (ctx.sizes.^2)*Y) / C).';
+        Mfine{j} = struct('t', tf, 'Mw', Mw);
+        in = tf >= D(j).edges(1) & tf < D(j).edges(end);
+        mb = accumarray(discretize(tf(in), D(j).edges), Mw(in), ...
+                        [numel(D(j).edges)-1, 1], @mean, NaN);
+        mb = mb(D(j).keep);
+        A = [A; mb, ones(numel(mb), 1)]; %#ok<AGROW>
+        b = [b; D(j).yb];                %#ok<AGROW>
+        w = [w; D(j).w];                 %#ok<AGROW>
+    end
+    good = all(isfinite(A), 2);
+    c = (A(good,:) .* w(good)) \ (b(good) .* w(good));
+    r = (A(good,:)*c - b(good)) .* w(good);
+    rms_tot = sqrt(sum(r.^2) / sum(w(good).^2));
+end
+
+function f = shape_features(t, y, y0, t_skip, pw)
+    f = struct('plateau', NaN, 'rel_depth', NaN, 't_min', NaN, ...
+               'rel_rebound', NaN, 't_max', NaN);
+    if all(isnan(y)), return; end
+    pl = mean(y(t >= pw(1) & t <= pw(2)), 'omitnan');
+    drop = y0 - pl;
+    if ~isfinite(drop) || abs(drop) < eps, return; end
+    idx = find(t >= t_skip & t < pw(1));
+    [ymin, im] = min(y(idx));
+    tmin = t(idx(im));
+    after = idx(t(idx) > tmin);
+    if isempty(after), ymax = ymin; tmax = tmin;
+    else, [ymax, ia] = max(y(after)); tmax = t(after(ia));
+    end
+    f.plateau = pl;
+    f.rel_depth   = (pl - ymin) / drop;
+    f.t_min       = tmin;
+    f.rel_rebound = (ymax - pl) / drop;
+    f.t_max       = tmax;
+end
+
+function a = abs_features(t, y, t_skip, pw, thr)
+    % Transient features in signal units (no normalization), based on the FIRST
+    % local minimum after the initial drop (prominence >= thr), so that both
+    % dip-then-rise and drop-then-bump shapes are captured:
+    %   plateau = mean over pw
+    %   t_min   = time of the first local minimum after t_skip (NaN if none)
+    %   dip     = plateau - y(t_min)          (0 if < thr, e.g. minimum above plateau)
+    %   rebound = max of y after t_min (before pw) - plateau   (0 if < thr)
+    %   drift   = change of y across pw (last quarter minus first quarter)
+    a = struct('plateau', NaN, 'dip', 0, 't_min', NaN, 'rebound', 0, 'drift', NaN);
+    ip = t >= pw(1) & t <= pw(2);
+    if ~any(ip), return; end
+    pl = mean(y(ip), 'omitnan');
+    a.plateau = pl;
+    q = (pw(2) - pw(1)) / 4;
+    a.drift = mean(y(t >= pw(2)-q & t <= pw(2)), 'omitnan') - ...
+              mean(y(t >= pw(1) & t <= pw(1)+q), 'omitnan');
+
+    idx = find(t >= t_skip & t < pw(1));
+    ti = t(idx);  yi = movmean(y(idx), 5, 'omitnan');   % light smoothing against noise
+    k = find(islocalmin(yi, 'MinProminence', thr), 1);
+    if isempty(k), return; end                         % monotone: no transient
+    a.t_min = ti(k);
+    dip = pl - yi(k);
+    reb = max(yi(k:end)) - pl;
+    a.dip     = dip * (dip >= thr);
+    a.rebound = reb * (reb >= thr);
+    q = (pw(2) - pw(1)) / 4;                  % drift: last quarter minus first quarter
+    a.drift = mean(y(t >= pw(2)-q & t <= pw(2)), 'omitnan') - ...
+              mean(y(t >= pw(1) & t <= pw(1)+q), 'omitnan');
+end
+
+function out = fit_damped(t, y)
+    % y = A + B e^{-t/tau1} + C e^{-t/tau2} cos(2 pi t/T + phi), vs two exponentials
+    f_osc = @(p, t) p(1) + p(2)*exp(-t/p(3)) + p(4)*exp(-t/p(5)).*cos(2*pi*t/p(6) + p(7));
+    f_2e  = @(p, t) p(1) + p(2)*exp(-t/p(3)) + p(4)*exp(-t/p(5));
+    o = optimoptions('lsqnonlin', 'Display', 'off', ...
+                     'MaxFunctionEvaluations', 5000, 'MaxIterations', 1000);
+    A0 = median(y(t >= 150));  if isnan(A0), A0 = y(end); end
+    B0 = y(1) - A0;  rg = max(y) - min(y);  n = numel(y);
+    best = Inf;  pb = [];
+    lb = [min(y)-rg, -10*rg, 0.2, 0,     3,  10, -2*pi];
+    ub = [max(y)+rg,  10*rg, 60,  10*rg, 500, 400, 4*pi];
+    for T0 = [30 50 70 100]
+        for ph0 = [0 pi/2 pi 3*pi/2]
+            for ta0 = [3 10]
+                [pp, rn] = lsqnonlin(@(pp) f_osc(pp, t) - y, [A0 B0 ta0 0.2*rg 40 T0 ph0], lb, ub, o);
+                if rn < best, best = rn; pb = pp; end
+            end
+        end
+    end
+    best2 = Inf;
+    lb2 = [min(y)-rg, -10*rg, 0.2, -10*rg, 0.2];
+    ub2 = [max(y)+rg,  10*rg, 60,   10*rg, 1000];
+    for ta0 = [2 5]
+        for tb0 = [30 100]
+            for sg = [-1 1]
+                [~, rn] = lsqnonlin(@(pp) f_2e(pp, t) - y, ...
+                                    [A0 B0/2 ta0 sg*abs(B0)/2 tb0], lb2, ub2, o);
+                best2 = min(best2, rn);
+            end
+        end
+    end
+    out.p = pb;
+    out.dAIC = (n*log(best2/n) + 2*5) - (n*log(best/n) + 2*7);
+end
+
+function export_both(fig, name)
+    try
+        exportgraphics(fig, [name '.pdf'], 'ContentType', 'vector');
+        exportgraphics(fig, [name '.png'], 'Resolution', 300);
+    catch
+        set(fig, 'PaperPositionMode', 'auto');
+        print(fig, name, '-dpdf', '-painters');
+        print(fig, name, '-dpng', '-r300');
+    end
+    fprintf('Saved %s.pdf and %s.png\n', name, name);
+end
