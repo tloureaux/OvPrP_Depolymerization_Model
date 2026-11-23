@@ -1,8 +1,7 @@
 clear all; clc;
 
-%% ---------------------------------------------------------
-%  PARAMETERS (fixed)
-%% ---------------------------------------------------------
+%  PARAMETERS
+
 alpha  = 1e-2;
 rho    = 0.7;
 omega  = 0.1;
@@ -15,7 +14,7 @@ tau    = 0.8;
 delta  = 0.8;
 k1     = 250;
 
-% Sweep over these C0 values
+% Sweep
 %C0_list = [linspace(0.01,0.36,36),linspace(0.366,0.368,21),linspace(0.4,10,97)];
 %C0_list = [linspace(0.01,0.36,36),linspace(0.366,0.368,21)];
 %C0_list = linspace(0.366,0.368,21);
@@ -29,9 +28,8 @@ n2  = 12;
 N   = 100;
 sizes = [1, nT, n1, n2 + nT*(0:N-1)];
 
-%% ---------------------------------------------------------
-%  STAGE 1: Polymerization (run ONCE)
-%% ---------------------------------------------------------
+%  STAGE 1: Polymerization
+
 M  = 100;
 Z0 = zeros(N+2,1);
 
@@ -48,25 +46,21 @@ z0(2) = 0;
 M_agreg  = sizes(2:end)*z0;
 z0_adim  = z0 / M_agreg;
 
-%% ---------------------------------------------------------
 %  3D FIGURE
-%% ---------------------------------------------------------
+
 figure; hold on; grid on;
 xlabel('t'); ylabel('Mw'); zlabel('C0');
 title('3D Trajectories in (t, Mw, C0)');
 view(45,25);
 
-%% ---------------------------------------------------------
 %  LOOP OVER C0 VALUES
-%% ---------------------------------------------------------
+
 for cidx = 1:length(C0_list)
 
     C0 = C0_list(cidx);
     fprintf('Running C0 = %.3f\n', C0);
 
-    %% ---------------------------------------------------------
-    %  LATE-STAGE DYNAMICS (base IC)
-    %% ---------------------------------------------------------
+    %  Base IC
     Z0_base = z0_adim * C0;
 
     F2 = @(t,Z) F_ode(Z, C0, n1, n2, N, alpha, sigma, rho, omega, ...
@@ -75,12 +69,11 @@ for cidx = 1:length(C0_list)
     [t_base, Y_late] = ode15s(F2, [0 500], Z0_base);
     Y_late = Y_late';
 
-    % W_base = Y_late(2,:); % no longer needed
+    % W_base = Y_late(2,:);
     Mw_base = 1 - (sizes(2:end)*Y_late)/C0 + (sizes(2:end).^2 * Y_late)/C0;
 
-    %% ---------------------------------------------------------
-    %  EQUILIBRIA FOR THIS C0 (optional, can remain the same)
-    %% ---------------------------------------------------------
+    %  EQUILIBRIA FOR C0
+    
     Sstar = @(W) (gamma*W + lambda*W.^2) ./ (2*(mu + k1*W));
     X = @(W) (4*beta^3*Sstar(W).^4)./(27*sigma*(mu + k1*W).^2);
     u_plus  = @(W) ((mu + k1*W)./(2*sigma)) .* (1 + sqrt(1 + X(W))) .* Sstar(W);
@@ -126,9 +119,8 @@ for cidx = 1:length(C0_list)
         Mwstarm = [Mwstarm Mw_eq];
     end
 
-    %% ---------------------------------------------------------
-    %  MULTIPLE TRAJECTORIES FOR THIS C0
-    %% ---------------------------------------------------------
+    %  MULTIPLE TRAJECTORIES FOR C0
+
     idxW = 2; idxS = 3;
 
     nIC  = 1;
