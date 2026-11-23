@@ -1,0 +1,277 @@
+clc; clear; close all;
+
+%% PARAMETERS
+P.alpha  = 1e-2;
+P.rho    = 0.7;
+P.omega  = 0.1;
+P.sigma  = 1e-4;
+P.beta   = 150;
+P.mu     = 0.01;
+P.lambda = 230;
+P.gamma  = 8;
+P.tau    = 0.8;
+P.delta  = 0.8;
+P.k1     = 250;
+
+P.nT = 2;
+P.n1 = 6;
+P.n2 = 12;
+P.N  = 100;
+
+f = make_formulas(P);
+
+%% C0 SWEEP
+  C0vals = [linspace(0.1, 2, 191), linspace(2.02, 6, 200)];
+nC     = numel(C0vals);
+nScan  = 30000;
+
+Wbr    = nan(nC,3);   Tbr = nan(nC,3);   Sbr = nan(nC,3);   Vbr = nan(nC,3);
+maxRe  = nan(nC,3);   leadIm = nan(nC,3);
+resAbs = nan(nC,3);   resRel = nan(nC,3);
+allEig = cell(nC,3);
+nroots = zeros(nC,1);
+
+for ic = 1:nC
+    C  = C0vals(ic);
+    Wr = find_equilibria(C, f, nScan);
+    nroots(ic) = numel(Wr);
+
+    for ib = 1:min(3, numel(Wr))
+        W0  = Wr(ib);
+        Zeq = build_eq(W0, f, P.N);
+
+        Wbr(ic,ib) = W0;
+        Tbr(ic,ib) = Zeq(1);
+        Sbr(ic,ib) = Zeq(3);
+        Vbr(ic,ib) = f.V(W0);
+
+        [ev, ra, rr] = stability(Zeq, C, P);
+        allEig{ic,ib} = ev;
+        [~,k] = max(real(ev));
+        maxRe(ic,ib)  = real(ev(k));
+        leadIm(ic,ib) = abs(imag(ev(k)));
+        resAbs(ic,ib) = ra;
+        resRel(ic,ib) = rr;
+    end
+    fprintf('C0 = %.4f | roots = %d\n', C, nroots(ic));
+end
+
+%% RESIDUALS (should be ~1e-12 or smaller everywhere)
+fprintf('\nMaximum equilibrium residual per root index:\n');
+for ib = 1:3
+    v = isfinite(resAbs(:,ib));
+    if any(v)
+        fprintf('  root %d: abs = %.3e   rel = %.3e\n', ib, max(resAbs(v,ib)), max(resRel(v,ib)));
+    else
+        fprintf('  root %d: none\n', ib);
+    end
+end
+
+%% CROSS-CHECK AT C0 = 6
+Wr6 = find_equilibria(6, f, nScan);
+if ~isempty(Wr6)
+    Z6 = build_eq(Wr6(end), f, P.N);
+    [ev6, ra6] = stability(Z6, 6, P);
+    [~,k] = max(real(ev6));
+    fprintf('\nCross-check C0 = 6: W* = %.6e, leading eig = %+.5e %+.5ei, residual = %.2e\n', ...
+            Wr6(end), real(ev6(k)), abs(imag(ev6(k))), ra6);
+end
+
+%% FOLDS
+fprintf('\nFold (saddle-node) locations:\n');
+foldC = [];
+for ic = 1:nC-1
+    if nroots(ic) ~= nroots(ic+1)
+        foldC(end+1) = 0.5*(C0vals(ic) + C0vals(ic+1));
+        fprintf('  C0 ~ %.4f  (%d -> %d equilibria)\n', foldC(end), nroots(ic), nroots(ic+1));
+    end
+end
+if isempty(foldC), fprintf('  none in range\n'); end
+
+%% HOPF
+fprintf('\nStability changes (refined):\n');
+hopf = [];   % rows: [C0, W*, Im(lambda)]
+for ib = 1:3
+    for ic = 1:nC-1
+        if nroots(ic) ~= nroots(ic+1), continue; end
+        ga = maxRe(ic,ib);  gb = maxRe(ic+1,ib);
+        if ~(isfinite(ga) && isfinite(gb)) || sign(ga) == sign(gb), continue; end
+
+        a = C0vals(ic);  b = C0vals(ic+1);  Wa = Wbr(ic,ib);
+        for it = 1:40
+            m  = 0.5*(a+b);
+            Wm = find_equilibria(m, f, nScan);
+            if isempty(Wm), break; end
+            [~,k] = min(abs(Wm - Wa));
+            evm = stability(build_eq(Wm(k), f, P.N), m, P);
+            [~,j] = max(real(evm));
+            gm = real(evm(j));  Im = abs(imag(evm(j)));
+            if sign(gm) == sign(ga)
+                a = m;  ga = gm;  Wa = Wm(k);
+            else
+                b = m;
+            end
+        end
+        if Im > 1e-6
+            kind = 'HOPF (complex pair)';
+        else
+            kind = 'real eigenvalue crossing (fold/branch point)';
+        end
+        fprintf('  C0 = %.6f | W* = %.6e | Im(lambda) = %.4e | %s\n', a, Wa, Im, kind);
+        if Im > 1e-6, hopf(end+1,:) = [a, Wa, Im]; end
+    end
+end
+if isempty(hopf), fprintf('  no Hopf point in range\n'); end
+
+%% PLOT 1: BIFURCATION DIAGRAM
+figure; hold on;
+% invisible dummy handles, used only for the legend
+hs = plot(nan, nan, 'b.', 'MarkerSize', 9);
+hu = plot(nan, nan, 'r.', 'MarkerSize', 9);
+for ib = 1:3
+    st = maxRe(:,ib) <  0;
+    un = maxRe(:,ib) >= 0;
+    if any(st), plot(C0vals(st), Wbr(st,ib), 'b.', 'MarkerSize', 9); end
+    if any(un), plot(C0vals(un), Wbr(un,ib), 'r.', 'MarkerSize', 9); end
+end
+hl = [hs hu];  lg = {'stable', 'unstable'};
+if ~isempty(hopf)
+    hh = plot(hopf(:,1), hopf(:,2), 'kp', 'MarkerSize', 12, 'MarkerFaceColor', 'y');
+    hl(end+1) = hh;  lg{end+1} = 'Hopf';
+end
+set(gca, 'YScale', 'log');
+xlabel('C_0'); ylabel('W^*');
+title('Equilibrium branches (blue: stable, red: unstable)');
+legend(hl, lg, 'Location', 'best');
+grid on; xlim([C0vals(1) C0vals(end)]);
+
+%% PLOT 2: REAL PART OF THE LEADING EIGENVALUE
+figure; hold on;
+mk = {'b.','r.','g.'};
+for ib = 1:3
+    plot(C0vals, maxRe(:,ib), mk{ib}, 'MarkerSize', 8);
+end
+yline(0, 'k--', 'HandleVisibility', 'off');
+
+lgd = {'root 1','root 2','root 3'};
+if ~isempty(hopf)
+    plot(hopf(:,1), zeros(size(hopf,1),1), 'kp', 'MarkerSize', 14, ...
+         'MarkerFaceColor', 'y');                       % star at Re(lambda) = 0
+    text(hopf(:,1), zeros(size(hopf,1),1) + 0.04, 'Hopf', ...
+         'HorizontalAlignment', 'center', 'VerticalAlignment', 'bottom', ...
+         'FontSize', 11);
+    lgd{end+1} = 'Hopf';
+end
+xlabel('C_0'); ylabel('max Re(\lambda)');
+legend(lgd, 'Location', 'best');
+title('Real part of the leading eigenvalue');
+grid on; xlim([C0vals(1) C0vals(end)]);
+
+%% PLOT 3: SPECTRA AT A CHOSEN C0
+C0show = 0.54;
+[~,ic0] = min(abs(C0vals - C0show));
+figure; hold on;
+cols = {'b','r',[0 0.55 0]};
+lg = {};
+for ib = 1:3
+    ev = allEig{ic0,ib};
+    if ~isempty(ev)
+        plot(real(ev), imag(ev), '.', 'Color', cols{ib}, 'MarkerSize', 10);
+        lg{end+1} = sprintf('root %d (W^* = %.2e)', ib, Wbr(ic0,ib));
+    end
+end
+xline(0, 'k--'); yline(0, 'k:');
+xlabel('Re(\lambda)'); ylabel('Im(\lambda)');
+title(sprintf('Spectra at C_0 = %.4f', C0vals(ic0)));
+legend(lg, 'Location', 'best'); grid on;
+
+%% FUNCTIONS
+
+function f = make_formulas(P)
+    a=P.alpha; r=P.rho; om=P.omega; sg=P.sigma; be=P.beta; mu=P.mu;
+    la=P.lambda; ga=P.gamma; ta=P.tau; de=P.delta; k1=P.k1;
+
+    f.S  = @(W) (ga*W + la*W.^2) ./ (2*(mu + k1*W));
+    X    = @(W) (4*be^3*f.S(W).^4) ./ (27*sg*(mu + k1*W).^2);
+    up   = @(W) ((mu+k1*W)./(2*sg)) .* (1 + sqrt(1+X(W))) .* f.S(W);
+    um   = @(W) ((mu+k1*W)./(2*sg)) .* (1 - sqrt(1+X(W))) .* f.S(W);
+    f.T  = @(W) nthroot(up(W),3) + nthroot(um(W),3);
+
+    A    = @(W) de*(a + ta*f.S(W) + r*f.T(W)) + ta*(om*f.T(W) + 3*la*W.^2);
+    B    = @(W) 4*de*ta*(a + r*f.T(W)) .* (om*f.T(W) + 3*la*W.^2);
+    V2   = @(W) (A(W)./(2*ta*(a + r*f.T(W)))) .* (1 - sqrt(1 - B(W)./A(W).^2));
+    f.V  = @(W) sqrt(max(0, real(V2(W))));
+    f.q  = @(W) ta*f.V(W).^2/de;
+
+    % Mass of the analytic equilibrium (infinite geometric tail; differs
+    % from the truncated system by O(q^N), checked via residuals)
+    f.mass = @(W) f.V(W) + P.nT*f.T(W) + P.n1*W + P.n2*f.S(W) ...
+             + ((14*f.q(W) - 12*f.q(W).^2) ./ (1 - f.q(W)).^2) .* f.S(W);
+end
+
+function Wr = find_equilibria(C, f, nScan)
+    fW = @(W) f.mass(W) - C;
+    Wg = linspace(1e-10, C/6, nScan);
+    Fg = fW(Wg);
+    ok = isfinite(Fg) & imag(Fg) == 0;
+    Fg = real(Fg);
+    idx = find(ok(1:end-1) & ok(2:end) & Fg(1:end-1).*Fg(2:end) < 0);
+    Wr = [];
+    for r = 1:numel(idx)
+        try
+            w = fzero(@(x) real(fW(x)), [Wg(idx(r)), Wg(idx(r)+1)]);
+            if isfinite(w) && w >= 0 && w <= C/6 && ...
+               (isempty(Wr) || all(abs(Wr - w) > 1e-9*max(1,w)))
+                Wr(end+1,1) = w;
+            end
+        catch
+        end
+    end
+    Wr = sort(Wr);
+end
+
+function Z = build_eq(W, f, N)
+    S = f.S(W);  q = f.q(W);
+    Z = [f.T(W); W; S; S*q.^(1:N-1).'];
+end
+
+function [ev, resAbs, resRel] = stability(Zeq, C, P)
+    rhs = @(Z) F_ode(Z, C, P.n1, P.n2, P.N, P.alpha, P.sigma, P.rho, P.omega, ...
+                     P.beta, P.mu, P.lambda, P.gamma, P.tau, P.delta, P.k1);
+    r0 = rhs(Zeq);
+    resAbs = norm(r0, inf);
+    resRel = resAbs / norm(Zeq, inf);
+
+    nz = numel(Zeq);
+    J  = zeros(nz);
+    for j = 1:nz
+        h  = eps^(1/3) * max(abs(Zeq(j)), 1e-10);   % relative step
+        Zp = Zeq;  Zp(j) = Zp(j) + h;
+        Zm = Zeq;  Zm(j) = Zm(j) - h;
+        J(:,j) = (rhs(Zp) - rhs(Zm)) / (2*h);
+    end
+    ev = eig(J);
+end
+
+function Y = F_ode(Z, M, n1, n2, N, alpha, sigma, rho, omega, ...
+                   beta, mu, lambda, gamma, tau, delta, k1)
+    % Z = [T; W; S; E1; ...; E_(N-1)],  M = total mass C0
+    sizes_red = [2, n1, n2, n2 + 2*(1:N-1)];
+    V = M - sizes_red*Z;
+    Y = zeros(N+2,1);
+
+    Y(1) = alpha*V^2 + rho*V^2*Z(1) - omega*Z(1) ...
+         - n1*(beta*Z(3)^2*Z(1) + sigma*Z(1)^3) ...
+         + delta*sum(Z(4:end)) + 3*gamma*Z(2);
+
+    Y(2) = 2*mu*Z(3) + 2*k1*Z(2)*Z(3) - gamma*Z(2) - lambda*Z(2)^2;
+
+    Y(3) = sigma*Z(1)^3 + beta*Z(3)^2*Z(1) - mu*Z(3) - k1*Z(2)*Z(3) ...
+         - tau*V^2*Z(3) + delta*Z(4);
+
+    for i = 4:N+1
+        Y(i) = tau*V^2*Z(i-1) - delta*Z(i) - (tau*V^2*Z(i) - delta*Z(i+1));
+    end
+
+    Y(N+2) = tau*V^2*Z(N+1) - delta*Z(N+2);
+end
