@@ -1,0 +1,73 @@
+T1 = readtable('SLS Data O1.xlsx');
+x1 = T1{:,1};
+y1 = T1{:,2};
+x2 = T1{:,3};
+y2 = T1{:,4};
+x3 = T1{:,5};
+y3 = T1{:,6};
+x4 = T1{:,7};
+y4 = T1{:,8};
+x5 = T1{:,9};
+y5 = T1{:,10};
+x6 = T1{:,11};
+y6 = T1{:,12};
+x7 = T1{:,13};
+y7 = T1{:,14};
+
+fig = figure('Position',[100 100 1300 480]);
+tl  = tiledlayout(fig,1,2,'TileSpacing','compact','Padding','compact');
+
+X = {x1, x2, x3, x4, x5, x6, x7};
+Y = {y1, y2, y3, y4, y5, y6, y7};
+labels = {'8 \muM','6 \muM','4 \muM','2 \muM','1 \muM','0.5 \muM','0.41 \muM'};
+
+ax = gobjects(2,1);
+for p = 1:2
+    ax(p) = nexttile(tl);
+    hold(ax(p),'on'); grid(ax(p),'on');
+    for j = 1:numel(X)
+        plot(ax(p), X{j}, Y{j}, '-');
+    end
+    xlabel(ax(p),'Time'); ylabel(ax(p),'M_w');
+    ylim(ax(p),[3000 9000]);
+end
+title(ax(1),'M_w');
+title(ax(2),'M_w (zoom)');
+
+lgd = legend(ax(1),labels,'Interpreter','tex');
+lgd.Layout.Tile = 'east';
+
+%% Zoom
+
+xz = [0 200];
+yz = ylim(ax(1));
+zc = [0.80 0.15 0.15];
+
+xlim(ax(2),xz);
+ylim(ax(2),yz);
+
+rectangle(ax(1),'Position',[xz(1) yz(1) diff(xz) diff(yz)],...
+    'EdgeColor',zc,'LineWidth',1.5,'Clipping','off');
+rectangle(ax(2),'Position',[xz(1) yz(1) diff(xz) diff(yz)],...
+    'EdgeColor',zc,'LineWidth',2,'Clipping','off');
+
+ax(2).YAxisLocation = 'right';
+
+drawnow;
+[x1t,y1t] = data2fig(ax(1),xz(2),yz(2));
+[x1b,y1b] = data2fig(ax(1),xz(2),yz(1));
+[x2t,y2t] = data2fig(ax(2),xz(1),yz(2));
+[x2b,y2b] = data2fig(ax(2),xz(1),yz(1));
+
+annotation(fig,'line',[x1t x2t],[y1t y2t],'Color',zc,'LineStyle','--','LineWidth',1);
+annotation(fig,'line',[x1b x2b],[y1b y2b],'Color',zc,'LineStyle','--','LineWidth',1);
+
+%% Functions
+
+function [xf,yf] = data2fig(a,x,y)
+    fig = ancestor(a,'figure');
+    fp  = getpixelposition(fig);
+    p   = getpixelposition(a,true);
+    xf  = (p(1) + (x - a.XLim(1))/diff(a.XLim)*p(3)) / fp(3);
+    yf  = (p(2) + (y - a.YLim(1))/diff(a.YLim)*p(4)) / fp(4);
+end
