@@ -1,0 +1,244 @@
+% Variants
+%   0 full model
+%   1 k = 0           no catalyzed depolymerization of S by W
+%   2 lambda = 0      no self-disintegration of W into monomers
+%   3 beta = 0        no autocatalysis of S (sigma kept)
+%   4 rho = 0         no autocatalysis of T (alpha kept)
+%   5 release 2M      depolymerization E_{i+1} -> E_i + 2M (symmetric with growth)
+%   6 no W            S -> 6T directly at rate mu (no 6-mer intermediate)
+%   7 no phase switch gamma, tau, delta, k equal in both phases (phase-1 values)
+%     Rate ablations (1-4) apply to BOTH phases.
+%
+%   Graphs for each variant:
+%   A. Oligomers form
+%   B. Bistability
+%   C. Sustained oscillations
+%   D. Fit to the SLS data
+%   E. Features at the fitted s (SLS units)
+
+clear; clc;
+warning('off', 'MATLAB:ode15s:IntegrationTolNotMet');
+
+%% Settings
+dataFile = 'SLS Data O1.xlsx';
+C0_list  = [8 6 4 2 1 0.5 0.41];
+N = 100;  M0 = 100;  T1 = 300;
+s_bounds = [0.5 10];
+
+Cgrid   = logspace(-1, 1, 13);
+T_long  = 3000;
+br_tol  = 0.2;                   % relative difference = different branches
+osc_tol = 0.01;                  % relative peak-to-peak over last 20% = oscillation
+
+t_skip = 2;  T_fit = 200;  bin_w = 2;  plateau_win = [150 200];
+smooth_win = 3;  thr_sls = 30;  dt = 0.05;
+odeopts = odeset('RelTol', 1e-7, 'AbsTol', 1e-10);
+
+ph1 = struct('alpha',1e-2,'rho',0.7,'omega',0.1,'sigma',1e-4,'beta',150,'mu',0.01, ...
+             'lambda',230,'gamma',5,'tau',0.1,'delta',0.1,'k',10);
+ph2 = ph1;  ph2.gamma = 8;  ph2.tau = 0.8;  ph2.delta = 0.8;  ph2.k = 250;
+
+V = struct('name', {}, 'p1', {}, 'p2', {}, 'opt', {});
+base_opt = struct('release2M', false, 'noW', false);
+add = @(V, nm, p1, p2, opt) [V, struct('name', nm, 'p1', p1, 'p2', p2, 'opt', opt)];
+V = add(V, '0 full model', ph1, ph2, base_opt);
+a = ph1; b = ph2; a.k = 0;      b.k = 0;      V = add(V, '1 k = 0', a, b, base_opt);
+a = ph1; b = ph2; a.lambda = 0; b.lambda = 0; V = add(V, '2 lambda = 0', a, b, base_opt);
+a = ph1; b = ph2; a.beta = 0;   b.beta = 0;   V = add(V, '3 beta = 0', a, b, base_opt);
+a = ph1; b = ph2; a.rho = 0;    b.rho = 0;    V = add(V, '4 rho = 0', a, b, base_opt);
+o = base_opt; o.release2M = true;             V = add(V, '5 release 2M', ph1, ph2, o);
+o = base_opt; o.noW = true;                   V = add(V, '6 no W', ph1, ph2, o);
+V = add(V, '7 no phase switch', ph1, ph1, base_opt);
+nV = numel(V);
+
+%% Data
+raw = readmatrix(dataFile);
+nC  = numel(C0_list);
+binmed = @(t, v, e) accumarray(discretize(t, e), v, [numel(e)-1, 1], @median, NaN);
+D = struct('C0', {}, 'edges', {}, 'keep', {}, 'yb', {}, 'w', {}, 'afeat', {});
+for j = 1:nC
+    t = raw(:, 2*j-1);  y = raw(:, 2*j);  ok = ~isnan(t) & ~isnan(y);  t = t(ok);  y = y(ok);
+    e = t_skip:bin_w:min(T_fit, max(t));  in = t >= e(1) & t < e(end);
+    yb = binmed(t(in), y(in), e);  keep = ~isnan(yb);  n = sum(keep);
+    e1 = 0:1:min(T_fit, max(t));  in1 = t >= e1(1) & t < e1(end);
+    y1 = binmed(t(in1), y(in1), e1);  t1 = e1(1:end-1).' + 0.5;  k1 = ~isnan(y1);
+    D(j) = struct('C0', C0_list(j), 'edges', e, 'keep', keep, 'yb', yb(keep), ...
+                  'w', ones(n,1)/sqrt(n), ...
+                  'afeat', abs_features(t1(k1), y1(k1), t_skip, plateau_win, thr_sls));
+end
+j8 = find(C0_list == 8);  j05 = find(C0_list == 0.5);
+
+ctx = struct('N', N, 'sizes', [2, 6, 12 + 2*(0:N-1)], 'dt', dt, 'odeopts', odeopts);
+
+%% Variants
+R = struct('name', {}, 'olig', {}, 'bist', {}, 'bist_C', {}, 'osc', {}, 'osc_C', {}, ...
+           's', {}, 'rms', {}, 'dip8', {}, 'tmin8', {}, 'reb05', {}, 'Mfine', {}, 'c', {});
+for v = 1:nV
+    fprintf('\n===== %s =====\n', V(v).name);  tic;
+    opt = V(v).opt;
+
+    % A: stage 1
+    F1 = @(t, Z) F_ode_ablate(Z, M0, N, V(v).p1, opt);
+    [~, Y1] = ode15s(F1, [0 T1], zeros(N+2, 1), odeopts);
+    zr = Y1(end, :).';
+    frac_struct = ctx.sizes(3:end)*zr(3:end) / M0;     % mass in S + E
+    olig = frac_struct >= 0.01;
+    fprintf('A. mass in S+E after oligomerization: %.1f%%\n', 100*frac_struct);
+    r = struct('name', V(v).name, 'olig', olig, 'bist', NaN, 'bist_C', [NaN NaN], ...
+               'osc', NaN, 'osc_C', [NaN NaN], 's', NaN, 'rms', NaN, 'dip8', NaN, ...
+               'tmin8', NaN, 'reb05', NaN, 'Mfine', {{}}, 'c', [NaN; NaN]);
+    if ~olig
+        fprintf('   no oligomers form: remaining checks skipped\n');
+        R(v) = r;  continue;
+    end
+    z = zr;  z(1:2) = 0;  z = z / (ctx.sizes*z);
+
+    % B, C: long runs on the C0 grid
+    MwP = nan(size(Cgrid));  MwM = MwP;  oscP = MwP;
+    for g = 1:numel(Cgrid)
+        C = Cgrid(g);
+        F2 = @(t, Z) F_ode_ablate(Z, C, N, V(v).p2, opt);
+        [MwP(g), oscP(g)] = long_run(F2, z*C, C, T_long, ctx);
+        MwM(g) = long_run(F2, zeros(N+2,1), C, T_long, ctx);
+    end
+    diffb = abs(MwP - MwM) ./ max(MwP, MwM) > br_tol;
+    r.bist = any(diffb);
+    if r.bist, r.bist_C = [min(Cgrid(diffb)) max(Cgrid(diffb))]; end
+    oscb = oscP > osc_tol;
+    r.osc = any(oscb);
+    if r.osc, r.osc_C = [min(Cgrid(oscb)) max(Cgrid(oscb))]; end
+    fprintf('B. bistability: %d   C. sustained oscillations: %d\n', r.bist, r.osc);
+
+    % D: fit s
+    obj = @(ls) global_rms(exp(ls), z, V(v).p2, opt, D, ctx);
+    [ls, rms] = fminbnd(obj, log(s_bounds(1)), log(s_bounds(2)), optimset('TolX', 1e-3));
+    r.s = exp(ls);
+    [r.rms, r.c, r.Mfine] = global_rms(r.s, z, V(v).p2, opt, D, ctx);
+    fprintf('D. s = %.3g, RMS = %.1f\n', r.s, r.rms);
+
+    % E: features at the fitted s
+    f8  = model_features(r.Mfine{j8},  r.c, t_skip, plateau_win, smooth_win, thr_sls, dt);
+    f05 = model_features(r.Mfine{j05}, r.c, t_skip, plateau_win, smooth_win, thr_sls, dt);
+    r.dip8 = f8.dip;  r.tmin8 = f8.t_min;  r.reb05 = f05.rebound;
+    fprintf('E. 8 uM: dip %.0f at %.1f min;  0.5 uM: rebound %.0f   (%.0f s)\n', ...
+            r.dip8, r.tmin8, r.reb05, toc);
+    R(v) = r;
+end
+
+%% Summary table
+fprintf('\n\n================ ABLATION SUMMARY ================\n');
+fprintf('Data: 8 uM dip %.0f at %.1f min; 0.5 uM rebound %.0f (SLS units)\n\n', ...
+        D(j8).afeat.dip, D(j8).afeat.t_min, D(j05).afeat.rebound);
+fprintf('%-20s | %5s | %-16s | %-16s | %6s %6s | %8s %6s | %7s\n', 'variant', 'olig', ...
+        'bistable (C0)', 'oscill. (C0)', 's', 'RMS', 'dip 8uM', 'tmin', 'reb 0.5');
+for v = 1:nV
+    r = R(v);
+    b = yn(r.bist);  if r.bist == 1, b = sprintf('yes %.2g-%.2g', r.bist_C); end
+    o = yn(r.osc);   if r.osc == 1,  o = sprintf('yes %.2g-%.2g', r.osc_C); end
+    fprintf('%-20s | %5s | %-16s | %-16s | %6.2f %6.0f | %8.0f %6.1f | %7.0f\n', r.name, ...
+            yn(double(r.olig)), b, o, r.s, r.rms, r.dip8, r.tmin8, r.reb05);
+end
+fprintf('(bistable/oscillation ranges in model units; dip, rebound in SLS units)\n');
+
+T = table(string({R.name}).', [R.olig].', [R.bist].', [R.osc].', [R.s].', [R.rms].', ...
+          [R.dip8].', [R.tmin8].', [R.reb05].', 'VariableNames', ...
+          {'variant','oligomers','bistable','oscillations','s','RMS','dip_8uM', ...
+           'tmin_8uM','rebound_05uM'});
+writetable(T, 'ablation_summary.csv');
+save('ablation_result.mat', 'R', 'V', 'Cgrid');
+fprintf('Saved ablation_summary.csv and ablation_result.mat\n');
+
+%% Figures, fit at C0 = 8 and 0.5
+fig = figure('Color', 'w', 'Position', [60 60 900 1100]);
+tl = tiledlayout(nV, 2, 'TileSpacing', 'tight', 'Padding', 'compact');
+for v = 1:nV
+    for jj = [j8 j05]
+        ax = nexttile(tl); hold(ax, 'on');
+        plot(ax, D(jj).edges(1:end-1)+bin_w/2, nan_fill(D(jj)), 'k.', 'MarkerSize', 5);
+        if ~isempty(R(v).Mfine)
+            M = R(v).Mfine{jj};
+            plot(ax, M.t, R(v).c(1)*M.Mw + R(v).c(2), '-', 'LineWidth', 1.5);
+        end
+        xlim(ax, [0 T_fit]);  grid(ax, 'on');  box(ax, 'on');  set(ax, 'FontSize', 8);
+        if v == 1, title(ax, sprintf('%.2g \\muM', C0_list(jj)), 'FontWeight', 'normal'); end
+        if jj == j8, ylabel(ax, V(v).name, 'FontSize', 8); end
+    end
+end
+
+%% Functions
+
+function [Mw_late, osc_rel] = long_run(F, Z0, C, Tend, ctx)
+    Mw_late = NaN;  osc_rel = NaN;
+    try
+        sol = ode15s(F, [0 Tend], Z0, ctx.odeopts);
+        if sol.x(end) < Tend*(1 - 1e-9), return; end
+        tl = linspace(0.8*Tend, Tend, 4000);
+        Y  = deval(sol, tl);
+        Mw = (C - ctx.sizes*Y + (ctx.sizes.^2)*Y) / C;
+        Mw_late = mean(Mw);
+        osc_rel = (max(Mw) - min(Mw)) / Mw_late;
+    catch
+    end
+end
+
+function [rms_tot, c, Mfine] = global_rms(s, z, p, opt, D, ctx)
+    q = p;
+    q.alpha = p.alpha*s;  q.lambda = p.lambda*s;  q.k = p.k*s;
+    q.rho = p.rho*s^2;  q.sigma = p.sigma*s^2;  q.beta = p.beta*s^2;  q.tau = p.tau*s^2;
+    A = [];  b = [];  w = [];  Mfine = cell(numel(D), 1);  c = [NaN; NaN];  rms_tot = 1e6;
+    for j = 1:numel(D)
+        C = D(j).C0;  tmax = D(j).edges(end);
+        F2 = @(t, Z) F_ode_ablate(Z, C, ctx.N, q, opt);
+        try
+            sol = ode15s(F2, [0 tmax], z*C, ctx.odeopts);
+        catch
+            return;
+        end
+        if sol.x(end) < tmax*(1 - 1e-9), return; end
+        tf = (0:ctx.dt:tmax).';
+        Y  = deval(sol, tf.');
+        Mw = ((C - ctx.sizes*Y + (ctx.sizes.^2)*Y) / C).';
+        Mfine{j} = struct('t', tf, 'Mw', Mw);
+        in = tf >= D(j).edges(1) & tf < D(j).edges(end);
+        mb = accumarray(discretize(tf(in), D(j).edges), Mw(in), ...
+                        [numel(D(j).edges)-1, 1], @mean, NaN);
+        mb = mb(D(j).keep);
+        A = [A; mb, ones(numel(mb),1)];  b = [b; D(j).yb];  w = [w; D(j).w];
+    end
+    g = all(isfinite(A), 2);
+    c = (A(g,:) .* w(g)) \ (b(g) .* w(g));
+    r = (A(g,:)*c - b(g)) .* w(g);
+    rms_tot = sqrt(sum(r.^2) / sum(w(g).^2));
+end
+
+function f = model_features(M, c, t_skip, pw, sw, thr, dt)
+    f = struct('dip', NaN, 't_min', NaN, 'rebound', NaN);
+    if isempty(M), return; end
+    y = c(1)*movmean(M.Mw, round(sw/dt)) + c(2);
+    a = abs_features(M.t, y, t_skip, pw, thr);
+    f.dip = a.dip;  f.t_min = a.t_min;  f.rebound = a.rebound;
+end
+
+function a = abs_features(t, y, t_skip, pw, thr)
+    % first local minimum after the drop, SLS units (as in fig_model_vs_data.m)
+    a = struct('plateau', NaN, 'dip', 0, 't_min', NaN, 'rebound', 0);
+    ip = t >= pw(1) & t <= pw(2);
+    if ~any(ip), return; end
+    pl = mean(y(ip), 'omitnan');  a.plateau = pl;
+    idx = find(t >= t_skip & t < pw(1));
+    ti = t(idx);  yi = movmean(y(idx), 5, 'omitnan');
+    k = find(islocalmin(yi, 'MinProminence', thr), 1);
+    if isempty(k), return; end
+    a.t_min = ti(k);
+    dip = pl - yi(k);  reb = max(yi(k:end)) - pl;
+    a.dip = dip*(dip >= thr);  a.rebound = reb*(reb >= thr);
+end
+
+function s = yn(x)
+    x = double(x);
+    if isnan(x), s = '-'; elseif x, s = 'yes'; else, s = 'no'; end
+end
+
+function y = nan_fill(Dj)
+    y = nan(numel(Dj.edges)-1, 1);  y(Dj.keep) = Dj.yb;
+end
