@@ -1,0 +1,141 @@
+clear; clc;
+warning('off', 'MATLAB:ode15s:IntegrationTolNotMet');
+
+%% Settings
+C0_grid = 0.30:0.01:0.90;
+fS_grid = linspace(0, 0.2, 41);       % mass fraction in bases S
+panels  = [0 0];
+T_end   = 2000;                       % long enough to settle
+use_parallel = false;
+
+fig15  = [];
+C0_exp = [];
+out    = 'fig_basin_S';
+
+% Parameter set
+q = struct('alpha',1e-2,'rho',0.7,'omega',0.1,'sigma',1e-4,'beta',150, ...
+           'mu',0.01,'lambda',230,'gamma1',5,'tau1',0.1,'delta1',0.1,'k1',10, ...
+           'gamma2',8,'tau2',0.8,'delta2',0.8,'k2',250);
+M0 = 100;  T1 = 300;  N = 100;
+odeopts = odeset('RelTol', 1e-7, 'AbsTol', 1e-10);
+dt_late = 0.5;                        % sampling of the final 10%
+
+%% Stage 1
+sizes = [2, 6, 12 + 2*(0:N-1)];       % [T; W; S; E_1..E_{N-1}]
+F1 = @(t, Z) F_ode(Z, M0, 6, 12, N, q.alpha, q.sigma, q.rho, q.omega, q.beta, ...
+                   q.mu, q.lambda, q.gamma1, q.tau1, q.delta1, q.k1);
+[~, Y1] = ode15s(F1, [0 T1], zeros(N+2, 1), odeopts);
+z = Y1(end, :).';  z(1:2) = 0;  z = z / (sizes*z);   % T = W = 0
+
+fS_stage1 = 12*z(3);                  % mass fraction in S of the real P1 sample
+E_shape = z;  E_shape(1:3) = 0;
+E_shape = E_shape / (sizes*E_shape);  % aggregate distribution
+fprintf('Stage-1 P1 sample: S mass fraction = %.4f, aggregates = %.4f\n', ...
+        fS_stage1, 1 - fS_stage1);
+
+%% Sweep
+nC = numel(C0_grid);  nS = numel(fS_grid);  nPan = size(panels, 1);
+MW = nan(nS, nC, nPan);
+for pnl = 1:nPan
+    fT = panels(pnl, 1);  fW = panels(pnl, 2);
+    fprintf('\nPanel %d: fT = %.2f, fW = %.2f ...\n', pnl, fT, fW);
+    tic;
+    res = nan(nS, nC);
+    if use_parallel
+        parfor ic = 1:nC
+            res(:, ic) = column(C0_grid(ic), fS_grid, fT, fW, E_shape, q, N, sizes, ...
+                                T_end, dt_late, odeopts);
+        end
+    else
+        for ic = 1:nC
+            res(:, ic) = column(C0_grid(ic), fS_grid, fT, fW, E_shape, q, N, sizes, ...
+                                T_end, dt_late, odeopts);
+            fprintf('  C0 = %.3f done (%.0f s)\n', C0_grid(ic), toc);
+        end
+    end
+    MW(:, :, pnl) = res;
+end
+
+% Branch threshold (in log)
+v = log(MW(isfinite(MW)));
+thr = exp(two_cluster_split(v));
+fprintf('\nBranch threshold (Mw) = %.3g  (lower branch below, upper above)\n', thr);
+
+%% Along the protocol line
+fprintf('\nIdentical composition (fT = fW = 0, fS = stage-1 value):\n');
+fprintf('%8s | %8s | %s\n', 'C0', 'Mw_inf', 'branch');
+for ic = 1:nC
+    m = column(C0_grid(ic), fS_stage1, 0, 0, E_shape, q, N, sizes, T_end, dt_late, odeopts);
+    if m > thr, b = 'upper'; else, b = 'lower'; end
+    fprintf('%8.3f | %8.3f | %s\n', C0_grid(ic), m, b);
+end
+fprintf('(non-monotonic Mw along this line would need a switch lower -> upper -> lower)\n');
+
+save('basin_map_result.mat', 'C0_grid', 'fS_grid', 'panels', 'MW', 'thr', 'fS_stage1', 'q');
+
+%% Figures
+figure('Name', 'Basins of attraction', 'Position', [60 60 560*nPan 470]);
+clim = [min(MW(:)), max(MW(:))];
+for pnl = 1:nPan
+    subplot(1, nPan, pnl); hold on;
+    imagesc(C0_grid, fS_grid, MW(:, :, pnl));
+    set(gca, 'YDir', 'normal');  axis tight;
+    caxis(clim);  cb = colorbar;  ylabel(cb, 'M_{w}^{tr}');
+    if panels(pnl,1) == 0 && panels(pnl,2) == 0
+        yline(fS_stage1, '--', sprintf('(12S(0)/C_0 = %.3f)', fS_stage1), ...
+              'LineWidth', 2, 'Color', [0.85 0 0], 'LabelHorizontalAlignment', 'right');
+    end
+    for c = C0_exp, xline(c, 'w:', 'LineWidth', 1.2); end
+    if ~isempty(fig15)
+        sel = abs(fig15(:,2) - panels(pnl,1)) < 1e-9 & abs(fig15(:,3) - panels(pnl,2)) < 1e-9;
+        plot(fig15(sel,1), fig15(sel,4), 'wo', 'MarkerSize', 9, 'LineWidth', 2, ...
+             'MarkerFaceColor', 'r');
+    end
+    xlabel('C_0 (\muM)');  ylabel('12S(0)/C_0');
+    title(sprintf('f_T = %.2f, f_W = %.2f', panels(pnl,1), panels(pnl,2)));
+end
+title('Basins of attraction, M(0) = T(0) = W(0) = 0', 'FontWeight', 'normal');
+try
+    exportgraphics(gcf, [out '.pdf'], 'ContentType', 'vector');
+    exportgraphics(gcf, [out '.png'], 'Resolution', 300);
+catch
+    set(gcf, 'PaperPositionMode', 'auto');
+    print(gcf, out, '-dpdf', '-painters');  print(gcf, out, '-dpng', '-r300');
+end
+fprintf('Saved %s.pdf and %s.png\n', out, out);
+
+%% Functions
+
+function m = column(C0, fS_list, fT, fW, E_shape, q, N, sizes, T_end, dt_late, odeopts)
+    F2 = @(t, Z) F_ode(Z, C0, 6, 12, N, q.alpha, q.sigma, q.rho, q.omega, q.beta, ...
+                       q.mu, q.lambda, q.gamma2, q.tau2, q.delta2, q.k2);
+    m = nan(numel(fS_list), 1);
+    for k = 1:numel(fS_list)
+        fS = fS_list(k);
+        fE = 1 - fT - fW - fS;
+        if fE < 0, continue; end
+        Z0 = fE*C0*E_shape;
+        Z0(1) = fT*C0/2;  Z0(2) = fW*C0/6;  Z0(3) = fS*C0/12;
+        try
+            sol = ode15s(F2, [0 T_end], Z0, odeopts);
+            if sol.x(end) < T_end*(1 - 1e-9), continue; end
+            tl = (0.9*T_end:dt_late:T_end);
+            Y  = deval(sol, tl);
+            m(k) = mean((C0 - sizes*Y + (sizes.^2)*Y) / C0);
+        catch
+        end
+    end
+end
+
+function s = two_cluster_split(v)
+    % 1-D two-means on v; returns the midpoint between the two cluster means
+    v = sort(v(:));
+    c = [v(1); v(end)];
+    for it = 1:100
+        a = abs(v - c(1)) <= abs(v - c(2));
+        cn = [mean(v(a)); mean(v(~a))];
+        if any(isnan(cn)) || max(abs(cn - c)) < 1e-12, break; end
+        c = cn;
+    end
+    s = mean(c);
+end
