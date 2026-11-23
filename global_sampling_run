@@ -1,0 +1,284 @@
+clear; clc;
+warning('off', 'MATLAB:ode15s:IntegrationTolNotMet');
+
+%% Settings
+sampleFile = 'global_sample_lowC0_result_heat0.mat';
+sample_id  = 1224;
+
+dataFile   = 'SLS Data O1.xlsx';
+C0_list    = [8 6 4 2 1 0.5 0.41];
+fit_stages = {[5 6 7], 1:7};      % low C0 first, then all curves
+
+T_fit     = 200;  t_skip = 2;  bin_w = 2;
+os_window = [2 80];  w_os = 5;
+plateau_win = [150 200];  smooth_win = 3;  thr_sls = 30;
+
+rate_fac  = 10;          % bounds: start x/rate_fac to x*rate_fac (and ratios likewise)
+enforce_heating = false; % true: 1 <= phase-2/phase-1 <= heat_max for gamma, tau, delta, k
+heat_max  = 25;
+n_starts  = 2;  spread = log(2);
+
+N = 100;  M0 = 100;  T1 = 300;  dt_fine = 0.05;
+odeopts = odeset('RelTol', 1e-7, 'AbsTol', 1e-10);
+
+names = {'alpha','rho','omega','sigma','beta','mu','lambda', ...
+         'gamma1','tau1','delta1','k1','gamma2','tau2','delta2','k2'};
+base  = [1e-2, 0.7, 0.1, 1e-4, 150, 0.01, 230, 5, 0.1, 0.1, 10, 8, 0.8, 0.8, 250];
+pairs = [8 12; 9 13; 10 14; 11 15];
+
+%% Start point
+S = load(sampleFile);
+p_start = S.P(sample_id, :);
+s_fix   = S.s_all(sample_id);
+fprintf('Starting from sample #%d (s = %.3f fixed)\n', sample_id, s_fix);
+
+x0 = zeros(15, 1);  lb = zeros(15, 1);  ub = zeros(15, 1);
+x0(1:11) = log(p_start(1:11));
+lb(1:11) = x0(1:11) - log(rate_fac);  ub(1:11) = x0(1:11) + log(rate_fac);
+for r = 1:4
+    i1 = pairs(r,1);  i2 = pairs(r,2);
+    x0(11+r) = log(p_start(i2) / p_start(i1));
+    if enforce_heating
+        lb(11+r) = 0;  ub(11+r) = log(heat_max);
+        if x0(11+r) < 0 || x0(11+r) > log(heat_max)
+            fprintf('  note: start ratio %s/%s = %.3g clipped to [1, %g]\n', ...
+                    names{i2}, names{i1}, exp(x0(11+r)), heat_max);
+            x0(11+r) = min(max(x0(11+r), 0), log(heat_max));
+        end
+    else
+        lb(11+r) = x0(11+r) - log(rate_fac);  ub(11+r) = x0(11+r) + log(rate_fac);
+    end
+end
+
+%% Data
+raw = readmatrix(dataFile);
+nC  = numel(C0_list);
+binmed = @(t, v, e) accumarray(discretize(t, e), v, [numel(e)-1, 1], @median, NaN);
+allc = struct('C0', {}, 'edges', {}, 'keep', {}, 'tb', {}, 'yb', {}, 'w', {}, ...
+              't', {}, 'y', {}, 'afeat', {});
+for j = 1:nC
+    t = raw(:, 2*j-1);  y = raw(:, 2*j);
+    ok = ~isnan(t) & ~isnan(y);  t = t(ok);  y = y(ok);
+    e  = t_skip:bin_w:min(T_fit, max(t));
+    in = t >= e(1) & t < e(end);
+    yb = binmed(t(in), y(in), e);  keep = ~isnan(yb);
+    tb = e(1:end-1).' + bin_w/2;
+    w  = ones(numel(tb), 1);
+    w(tb >= os_window(1) & tb <= os_window(2)) = w_os;
+    w  = w(keep);  w = w / sqrt(sum(w.^2));
+    e1 = 0:1:min(T_fit, max(t));  in1 = t >= e1(1) & t < e1(end);
+    y1 = binmed(t(in1), y(in1), e1);  t1 = e1(1:end-1).' + 0.5;  k1 = ~isnan(y1);
+    allc(j) = struct('C0', C0_list(j), 'edges', e, 'keep', keep, 'tb', tb(keep), ...
+                     'yb', yb(keep), 'w', w, 't', t, 'y', y, ...
+                     'afeat', abs_features(t1(k1), y1(k1), t_skip, plateau_win, thr_sls));
+end
+
+ctx = struct('N', N, 'M0', M0, 'T1', T1, 'dt', dt_fine, 'odeopts', odeopts, ...
+             'sizes', [2, 6, 12 + 2*(0:N-1)], 's', s_fix, 'pairs', pairs);
+
+opts = optimoptions('lsqnonlin', 'Display', 'iter', ...
+    'MaxFunctionEvaluations', 3000, 'MaxIterations', 100, ...
+    'FiniteDifferenceStepSize', 1e-3, 'FunctionTolerance', 1e-8, 'StepTolerance', 1e-6);
+
+%% Stages
+x_cur = x0;
+res = struct('curves', {}, 'x', {}, 'resnorm', {}, 'c', {}, 'p', {});
+for stg = 1:numel(fit_stages)
+    fc = fit_stages{stg};
+    ctx.fitc = allc(fc);
+    ctx.yall = vertcat(ctx.fitc.yb);  ctx.wall = vertcat(ctx.fitc.w);
+    resfun = @(x) residuals(x, ctx);
+
+    fprintf('\n################ Stage %d: fitting C0 = %s ################\n', ...
+            stg, mat2str(C0_list(fc)));
+    fprintf('Initial weighted RSS = %.5g\n', sum(resfun(x_cur).^2));
+
+    rng(stg);
+    best.resnorm = Inf;
+    for k = 1:n_starts
+        xs = x_cur;
+        if k > 1, xs = min(max(x_cur + spread*(2*rand(15,1) - 1), lb), ub); end
+        fprintf('\n--- start %d / %d ---\n', k, n_starts);  tic;
+        [x, rn, ~, flag, ~, ~, J] = lsqnonlin(resfun, xs, lb, ub, opts);
+        fprintf('start %d: resnorm = %.5g, exitflag = %d, %.0f s\n', k, rn, flag, toc);
+        if rn < best.resnorm, best = struct('x', x, 'resnorm', rn, 'J', full(J)); end
+    end
+    [~, c] = residuals(best.x, ctx);
+    p = unpack(best.x, pairs);
+    res(stg) = struct('curves', fc, 'x', best.x, 'resnorm', best.resnorm, 'c', c, 'p', p);
+    x_cur = best.x;
+
+    % Report
+    fprintf('\nStage %d best: weighted RMS = %.4g  (c1 = %.4g, c2 = %.4g)\n', stg, ...
+            sqrt(best.resnorm/numel(fc)), c(1), c(2));
+    fprintf('%8s | %10s %10s | %8s %8s | %s\n', 'param', 'start', 'fitted', ...
+            '/start', '/Table2', 'bound?');
+    for i = 1:15
+        fprintf('%8s | %10.4g %10.4g | %8.3g %8.3g |\n', names{i}, p_start(i), p(i), ...
+                p(i)/p_start(i), p(i)/base(i));
+    end
+    nb = {};
+    for i = 1:15
+        if abs(best.x(i) - lb(i)) < 1e-3, nb{end+1} = [xname(i, names) ' LOWER']; end %#ok<SAGROW>
+        if abs(best.x(i) - ub(i)) < 1e-3, nb{end+1} = [xname(i, names) ' UPPER']; end %#ok<SAGROW>
+    end
+    if isempty(nb), fprintf('No parameter at a bound.\n');
+    else, fprintf('At bounds: %s\n', strjoin(nb, ', ')); end
+    for r = 1:4
+        rr = p(pairs(r,2)) / p(pairs(r,1));
+        if rr < 1
+            fprintf('  NOTE: %s/%s = %.3g < 1 (heating assumption violated)\n', ...
+                    names{pairs(r,2)}, names{pairs(r,1)}, rr);
+        end
+    end
+    JtJ = best.J.'*best.J;
+    fprintf('cond(J''J) = %.3g; ', cond(JtJ));
+    if rcond(JtJ) > 1e-14
+        Cv = inv(JtJ);  R = Cv ./ sqrt(diag(Cv)*diag(Cv).');
+        R(logical(eye(15))) = 0;
+        [ii, jj] = find(triu(abs(R) > 0.95));
+        if isempty(ii), fprintf('no pair with |r| > 0.95\n');
+        else
+            fprintf('pairs with |r| > 0.95:');
+            for m = 1:numel(ii)
+                fprintf(' (%s,%s: %.2f)', xname(ii(m), names), xname(jj(m), names), R(ii(m),jj(m)));
+            end
+            fprintf('\n');
+        end
+    else
+        fprintf('J''J singular: some directions are not constrained by the data\n');
+    end
+
+    % RMSE and transient features
+    q = scaled(p, s_fix);
+    z = stage1(q, ctx);
+    fprintf('\n%6s | %10s | %6s | %7s %7s | %6s %6s | %6s %6s | %6s %6s\n', 'C0', 'role', ...
+            'RMSE', 'lvl d', 'lvl m', 'dip d', 'dip m', 'tmn d', 'tmn m', 'reb d', 'reb m');
+    sim = cell(nC, 1);
+    for j = 1:nC
+        [tf, Mwf] = stage2(q, z, allc(j).C0, T_fit, ctx);
+        sim{j} = struct('t', tf, 'Mw', Mwf);
+        a = allc(j);
+        in = tf >= a.edges(1) & tf < a.edges(end);
+        mb = accumarray(discretize(tf(in), a.edges), Mwf(in), [numel(a.edges)-1, 1], @mean, NaN);
+        mb = mb(a.keep);
+        rmse = sqrt(mean((c(1)*mb + c(2) - a.yb).^2, 'omitnan'));
+        ySm = c(1)*movmean(Mwf, round(smooth_win/dt_fine)) + c(2);
+        fm = abs_features(tf, ySm, t_skip, plateau_win, thr_sls);  fd = a.afeat;
+        role = 'prediction';  if ismember(j, fc), role = 'fitted'; end
+        fprintf('%6.2f | %10s | %6.0f | %7.0f %7.0f | %6.0f %6.0f | %6.1f %6.1f | %6.0f %6.0f\n', ...
+                a.C0, role, rmse, fd.plateau, fm.plateau, fd.dip, fm.dip, fd.t_min, fm.t_min, ...
+                fd.rebound, fm.rebound);
+    end
+
+    % Plot
+    cols = lines(nC);
+    figure('Name', sprintf('v5 stage %d', stg), 'Color', 'w', 'Position', [50 50 1300 560]);
+    tl = tiledlayout(2, 4, 'TileSpacing', 'compact', 'Padding', 'compact');
+    for j = 1:nC
+        ax = nexttile(tl); hold(ax, 'on');
+        patch(ax, [os_window fliplr(os_window)], [3000 3000 9000 9000], [0.92 0.92 0.92], ...
+              'EdgeColor', 'none');
+        plot(ax, allc(j).t, allc(j).y, '-', 'Color', [cols(j,:) 0.25]);
+        plot(ax, allc(j).tb, allc(j).yb, 'k.', 'MarkerSize', 6);
+        plot(ax, sim{j}.t, c(1)*sim{j}.Mw + c(2), '-', 'Color', cols(j,:)*0.75, 'LineWidth', 1.8);
+        xlim(ax, [0 T_fit]);  ylim(ax, [3500 8500]);  grid(ax, 'on');  box(ax, 'on');
+        role = 'prediction';  if ismember(j, fc), role = 'fitted'; end
+        title(ax, sprintf('%.2g \\muM (%s)', C0_list(j), role), 'FontWeight', 'normal');
+    end
+    ax = nexttile(tl); axis(ax, 'off');
+    text(ax, 0, 0.8, sprintf('stage %d, start: sample #%d', stg, sample_id));
+    text(ax, 0, 0.6, sprintf('s = %.3g (fixed), heating constraint: %d', s_fix, enforce_heating));
+    text(ax, 0, 0.4, sprintf('SLS = %.3g M_w + %.4g', c(1), c(2)));
+end
+
+save(sprintf('fit_from_sample_v5_%d_heat%d.mat', sample_id, enforce_heating), ...
+     'res', 'names', 'base', 'p_start', 's_fix', 'sample_id', 'enforce_heating');
+fprintf('\nSaved results.\n');
+
+%% Functions
+
+function nm = xname(i, names)
+    if i <= 11, nm = names{i};
+    else, r = i - 11;  pr = {'gamma','tau','delta','k'};  nm = [pr{r} '2/' pr{r} '1'];
+    end
+end
+
+function p = unpack(x, pairs)
+    p = zeros(1, 15);
+    p(1:11) = exp(x(1:11));
+    for r = 1:4, p(pairs(r,2)) = p(pairs(r,1)) * exp(x(11+r)); end
+end
+
+function q = scaled(p, s)
+    c = num2cell(p);
+    [q.alpha, q.rho, q.omega, q.sigma, q.beta, q.mu, q.lambda, ...
+     q.gamma1, q.tau1, q.delta1, q.k1, q.gamma2, q.tau2, q.delta2, q.k2] = c{:};
+    q.alpha = q.alpha*s;  q.lambda = q.lambda*s;  q.k1 = q.k1*s;  q.k2 = q.k2*s;
+    q.rho = q.rho*s^2;  q.sigma = q.sigma*s^2;  q.beta = q.beta*s^2;
+    q.tau1 = q.tau1*s^2;  q.tau2 = q.tau2*s^2;
+    q.s = s;
+end
+
+function z = stage1(q, ctx)
+    M0 = ctx.M0 / q.s;
+    F1 = @(t, Z) F_ode(Z, M0, 6, 12, ctx.N, q.alpha, q.sigma, q.rho, q.omega, q.beta, ...
+                       q.mu, q.lambda, q.gamma1, q.tau1, q.delta1, q.k1);
+    [~, Y1] = ode15s(F1, [0 ctx.T1], zeros(ctx.N+2, 1), ctx.odeopts);
+    z = Y1(end, :).';  z(1:2) = 0;  z = z / (ctx.sizes*z);
+end
+
+function [tf, Mwf, ok] = stage2(q, z, C0, tmax, ctx)
+    F2 = @(t, Z) F_ode(Z, C0, 6, 12, ctx.N, q.alpha, q.sigma, q.rho, q.omega, q.beta, ...
+                       q.mu, q.lambda, q.gamma2, q.tau2, q.delta2, q.k2);
+    sol = ode15s(F2, [0 tmax], z*C0, ctx.odeopts);
+    ok  = sol.x(end) >= tmax*(1 - 1e-9);
+    tf  = (0:ctx.dt:min(tmax, sol.x(end))).';
+    Y   = deval(sol, tf.');
+    Mwf = ((C0 - ctx.sizes*Y + (ctx.sizes.^2)*Y) / C0).';
+end
+
+function [r, c] = residuals(x, ctx)
+    nres = numel(ctx.yall);  c = [NaN; NaN];
+    try
+        p = unpack(x, ctx.pairs);
+        q = scaled(p, ctx.s);
+        z = stage1(q, ctx);
+        if any(~isfinite(z)), r = 1e5*ones(nres,1); return; end
+        Mwb = cell(numel(ctx.fitc), 1);
+        for m = 1:numel(ctx.fitc)
+            f = ctx.fitc(m);
+            [tf, Mwf, ok] = stage2(q, z, f.C0, f.edges(end), ctx);
+            if ~ok || any(~isfinite(Mwf)), r = 1e5*ones(nres,1); return; end
+            in = tf >= f.edges(1) & tf < f.edges(end);
+            mb = accumarray(discretize(tf(in), f.edges), Mwf(in), ...
+                            [numel(f.edges)-1, 1], @mean, NaN);
+            Mwb{m} = mb(f.keep);
+        end
+        Mall = vertcat(Mwb{:});
+        if any(isnan(Mall)), r = 1e5*ones(nres,1); return; end
+        A = [Mall, ones(nres, 1)];
+        c = (A .* ctx.wall) \ (ctx.yall .* ctx.wall);
+        r = (A*c - ctx.yall) .* ctx.wall;
+    catch
+        r = 1e5*ones(nres, 1);
+    end
+end
+
+function a = abs_features(t, y, t_skip, pw, thr)
+    % same definitions as fig_model_vs_data.m (first local minimum, SLS units)
+    a = struct('plateau', NaN, 'dip', 0, 't_min', NaN, 'rebound', 0, 'drift', NaN);
+    ip = t >= pw(1) & t <= pw(2);
+    if ~any(ip), return; end
+    pl = mean(y(ip), 'omitnan');  a.plateau = pl;
+    q = (pw(2) - pw(1)) / 4;
+    a.drift = mean(y(t >= pw(2)-q & t <= pw(2)), 'omitnan') - ...
+              mean(y(t >= pw(1) & t <= pw(1)+q), 'omitnan');
+    idx = find(t >= t_skip & t < pw(1));
+    ti = t(idx);  yi = movmean(y(idx), 5, 'omitnan');
+    k = find(islocalmin(yi, 'MinProminence', thr), 1);
+    if isempty(k), return; end
+    a.t_min = ti(k);
+    dip = pl - yi(k);  reb = max(yi(k:end)) - pl;
+    a.dip = dip * (dip >= thr);  a.rebound = reb * (reb >= thr);
+end
