@@ -136,7 +136,7 @@ for cidx = 1:length(C0_list)
         [t_traj, Y_traj] = ode15s(F2, [0 500], Zk);
         Y_traj = Y_traj';
 
-        % W_traj  = Y_traj(2,:); % not used
+        % W_traj  = Y_traj(2,:);
         Mw_traj = 1 - (sizes(2:end)*Y_traj)/C0 + (sizes(2:end).^2 * Y_traj)/C0;
 
         % PLOT IN (t, Mw, C0) SPACE
